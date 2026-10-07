@@ -17,7 +17,7 @@ from tqdm import tqdm
 from config import LLM_MODEL, MIN_REVIEW_LENGTH
 from services.openai_runtime import require_api_key, user_facing_openai_error
 from services.rag_service import rag_document_count, similarity_search
-from services.text_split import detect_clause, page_number_from_metadata, split_contract_text
+from services.text_split import page_number_from_metadata, split_contract_pages
 
 RetrieveStatus = Literal["ok", "empty", "error"]
 ItemStatus = Literal["reviewed", "search_error", "no_evidence", "skipped_short"]
@@ -88,18 +88,11 @@ def split_contract_pdf(
             "message": f"{display_name} 추출 완료 (페이지 {len(documents)}). 검토 단위로 나눕니다...",
         }
 
-        units: list[dict] = []
-        for document in documents:
-            page = page_number_from_metadata(document.metadata)
-            for piece in split_contract_text(document.page_content or ""):
-                units.append(
-                    {
-                        "text": piece,
-                        "source_file": display_name,
-                        "page": page,
-                        "clause": detect_clause(piece),
-                    }
-                )
+        pages = [
+            (document.page_content or "", page_number_from_metadata(document.metadata))
+            for document in documents
+        ]
+        units = split_contract_pages(pages, source_file=display_name)
 
         if not units:
             yield {

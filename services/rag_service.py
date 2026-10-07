@@ -103,6 +103,7 @@ def rag_document_count() -> int:
 
 
 def existing_content_hashes() -> set[str]:
+    """완전히 저장된 문서의 content_hash만 중복으로 본다."""
     collection = get_existing_collection()
     if collection is None:
         return set()
@@ -115,22 +116,93 @@ def existing_content_hashes() -> set[str]:
     for meta in data.get("metadatas") or []:
         if not meta:
             continue
+        if not meta.get("index_complete"):
+            continue
         value = meta.get("content_hash")
         if value:
             hashes.add(str(value))
     return hashes
 
 
-def delete_ids(ids: list[str]) -> None:
-    if not ids:
-        return
+def delete_ids(ids: list[str]) -> dict:
+    """
+    ID 목록을 삭제한다.
+    반환: requested, deleted, remaining, ok
+    """
+    unique_ids = list(dict.fromkeys(ids or []))
+    result = {
+        "requested": len(unique_ids),
+        "deleted": 0,
+        "remaining": 0,
+        "ok": True,
+    }
+    if not unique_ids:
+        return result
+
     collection = get_existing_collection()
     if collection is None:
-        return
+        result["ok"] = True
+        return result
+
     try:
-        collection.delete(ids=ids)
+        collection.delete(ids=unique_ids)
     except Exception:
-        logger.warning("chroma delete failed count=%s", len(ids))
+        logger.warning("chroma delete failed count=%s", len(unique_ids))
+        result["ok"] = False
+
+    try:
+        remaining_data = collection.get(ids=unique_ids, include=[])
+        remaining = list(remaining_data.get("ids") or [])
+    except Exception:
+        remaining = unique_ids
+        result["ok"] = False
+
+    result["remaining"] = len(remaining)
+    result["deleted"] = result["requested"] - result["remaining"]
+    result["ok"] = result["remaining"] == 0
+    return result
+
+
+def mark_ids_complete(ids: list[str]) -> bool:
+    """저장이 모두 끝난 뒤에만 중복 판정용 완료 표시를 붙인다."""
+    if not ids:
+        return True
+    collection = get_existing_collection()
+    if collection is None:
+        return False
+    try:
+        data = collection.get(ids=ids, include=["metadatas"])
+        found_ids = list(data.get("ids") or [])
+        metadatas = list(data.get("metadatas") or [])
+        if len(found_ids) != len(ids):
+            return False
+        updated = []
+        for meta in metadatas:
+            item = dict(meta or {})
+            item["index_complete"] = True
+            updated.append(item)
+        collection.update(ids=found_ids, metadatas=updated)
+        return True
+    except Exception:
+        logger.warning("chroma mark complete failed count=%s", len(ids))
+        return False
+
+
+def _rollback_message(rollback: dict, api_message: str) -> str:
+    if rollback.get("ok"):
+        return (
+            "이번 업로드 저장에 실패해 새로 추가하려던 조각을 되돌렸습니다. "
+            + api_message
+            + " 같은 파일을 다시 업로드해 전체를 인덱싱할 수 있습니다."
+        )
+    remaining = rollback.get("remaining", 0)
+    deleted = rollback.get("deleted", 0)
+    return (
+        f"이번 업로드 저장에 실패했습니다. 신규 조각 중 {deleted}개는 지웠지만 "
+        f"{remaining}개는 남아 있을 수 있습니다. "
+        "상태의 조각 수를 확인한 뒤 같은 파일을 다시 업로드해 주세요. "
+        + api_message
+    )
 
 
 def _vectorstore_for_write() -> Chroma:
@@ -197,6 +269,7 @@ def index_pdfs(
     job_id = uuid.uuid4().hex
     added_ids: list[str] = []
     committed = False
+    failure_reported = False
 
     try:
         yield {
@@ -242,6 +315,8 @@ def index_pdfs(
                 meta["source_file"] = original
                 meta["content_hash"] = content_hash
                 meta["upload_job_id"] = job_id
+                # 완전히 끝난 뒤에만 True로 바꾼다. 불완전 저장은 중복으로 보지 않는다.
+                meta["index_complete"] = False
                 page = page_number_from_metadata(meta)
                 if page is not None:
                     meta["page"] = page
@@ -258,7 +333,6 @@ def index_pdfs(
                 }
                 continue
 
-            known_hashes.add(content_hash)
             accepted_names.append(original)
             yield {
                 "type": "progress",
@@ -276,6 +350,7 @@ def index_pdfs(
                         + ", ".join(failed_extract)
                     ),
                 }
+                failure_reported = True
                 return
             collection_count = rag_document_count()
             skip_note = (
@@ -286,7 +361,7 @@ def index_pdfs(
             fail_note = (
                 f"\n추출 실패: {', '.join(failed_extract)}" if failed_extract else ""
             )
-            yield {
+            done_event = {
                 "type": "done",
                 "stage": "ready" if collection_count > 0 else "idle",
                 "percent": 100,
@@ -298,6 +373,7 @@ def index_pdfs(
                 "failed_files": failed_extract,
             }
             committed = True
+            yield done_event
             return
 
         yield {
@@ -308,10 +384,13 @@ def index_pdfs(
         chunks = split_rag_documents(raw_docs)
         chunks = [c for c in chunks if c.page_content and c.page_content.strip()]
         for chunk in chunks:
-            chunk.metadata = _clean_metadata(dict(chunk.metadata or {}))
+            meta = dict(chunk.metadata or {})
+            meta["index_complete"] = False
+            chunk.metadata = _clean_metadata(meta)
 
         if not chunks:
             yield {"type": "error", "stage": "error", "message": "분할된 문서 조각이 없습니다."}
+            failure_reported = True
             return
 
         total = len(chunks)
@@ -332,22 +411,24 @@ def index_pdfs(
             for start in range(0, total, batch_size):
                 batch = chunks[start : start + batch_size]
                 ids = [f"{job_id}:{start + offset:06d}" for offset in range(len(batch))]
+                # 저장 호출 전에 ID를 추적한다. 배치 일부만 들어가도 롤백 대상에 포함한다.
+                added_ids.extend(ids)
                 try:
                     with _store_lock:
                         vectorstore.add_documents(batch, ids=ids)
                 except Exception as exc:
                     logger.error("embedding/store failed stored=%s total=%s", stored, total)
-                    delete_ids(added_ids)
+                    rollback = delete_ids(added_ids)
+                    reset_chroma_client()
+                    failure_reported = True
                     yield {
                         "type": "error",
                         "stage": "error",
-                        "message": (
-                            "이번 업로드 저장에 실패해 새로 추가한 조각만 되돌렸습니다. "
-                            + user_facing_openai_error(exc)
-                        ),
+                        "message": _rollback_message(rollback, user_facing_openai_error(exc)),
+                        "rollback_ok": bool(rollback.get("ok")),
+                        "rollback_remaining": int(rollback.get("remaining") or 0),
                     }
                     return
-                added_ids.extend(ids)
                 stored += len(batch)
                 pbar.update(len(batch))
                 yield {
@@ -358,6 +439,23 @@ def index_pdfs(
                     "current": stored,
                     "total": total,
                 }
+
+        reset_chroma_client()
+        if not mark_ids_complete(added_ids):
+            rollback = delete_ids(added_ids)
+            reset_chroma_client()
+            failure_reported = True
+            yield {
+                "type": "error",
+                "stage": "error",
+                "message": _rollback_message(
+                    rollback,
+                    "저장 완료 표시에 실패했습니다.",
+                ),
+                "rollback_ok": bool(rollback.get("ok")),
+                "rollback_remaining": int(rollback.get("remaining") or 0),
+            }
+            return
 
         reset_chroma_client()
         collection_count = rag_document_count()
@@ -371,7 +469,7 @@ def index_pdfs(
             if skipped_duplicates
             else ""
         )
-        yield {
+        done_event = {
             "type": "done",
             "stage": "ready",
             "percent": 100,
@@ -388,16 +486,25 @@ def index_pdfs(
             "skipped_duplicates": skipped_duplicates,
             "failed_files": failed_extract,
         }
+        # done을 보내기 전에 성공을 확정한다. 클라이언트가 직후 연결을 닫아도 롤백하지 않는다.
         committed = True
+        yield done_event
     except Exception as exc:
         logger.error("index_pdfs failed")
-        if added_ids:
-            delete_ids(added_ids)
-        yield {
-            "type": "error",
-            "stage": "error",
-            "message": user_facing_openai_error(exc),
-        }
+        if not failure_reported:
+            rollback = {"ok": True, "deleted": 0, "remaining": 0}
+            if added_ids and not committed:
+                rollback = delete_ids(added_ids)
+                reset_chroma_client()
+            yield {
+                "type": "error",
+                "stage": "error",
+                "message": _rollback_message(rollback, user_facing_openai_error(exc))
+                if added_ids
+                else user_facing_openai_error(exc),
+                "rollback_ok": bool(rollback.get("ok")),
+                "rollback_remaining": int(rollback.get("remaining") or 0),
+            }
     finally:
         if not committed and added_ids:
             delete_ids(added_ids)
