@@ -12,6 +12,7 @@ BASE_DIR = Path(__file__).resolve().parent
 # 업로드 PDF와 Chroma DB를 둘 폴더
 UPLOAD_DIR = BASE_DIR / "data" / "uploads"
 CHROMA_DIR = BASE_DIR / "data" / "chroma_db"
+CHROMA_BACKUP_DIR = BASE_DIR / "data" / "chroma_db_backups"
 
 # RAG(가이드라인/약관)용 업로드 폴더와 계약서 업로드 폴더를 분리
 RAG_UPLOAD_DIR = UPLOAD_DIR / "rag"
@@ -53,4 +54,5 @@ def ensure_directories() -> None:
     RAG_UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
     CONTRACT_UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
     CHROMA_DIR.mkdir(parents=True, exist_ok=True)
+    CHROMA_BACKUP_DIR.mkdir(parents=True, exist_ok=True)
     SAMPLE_DIR.mkdir(parents=True, exist_ok=True)

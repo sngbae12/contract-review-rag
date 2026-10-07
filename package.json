@@ -1,0 +1,11 @@
+{
+  "name": "contract-review-rag",
+  "private": true,
+  "description": "Frontend unit tests for Contract Review RAG",
+  "scripts": {
+    "test": "node --test tests/js/*.test.mjs"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

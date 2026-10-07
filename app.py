@@ -26,7 +26,7 @@ from services.openai_runtime import (
     reset_api_key,
     user_facing_openai_error,
 )
-from services.rag_service import index_pdfs, rag_document_count
+from services.rag_service import index_pdfs, rag_status_summary, usable_rag_count
 from services.review_agent import review_sentences, split_contract_pdf
 
 ensure_directories()
@@ -85,19 +85,26 @@ def _sse(payload: dict) -> str:
 
 
 def _sync_rag_state(processing: bool = False) -> int:
-    """화면 표시는 로컬 DB 개수를 따른다. 처리 중이 아니면 준비 여부도 DB와 맞춘다."""
-    chunk_count = rag_document_count()
-    APP_STATE["rag_chunk_count"] = chunk_count
+    """검토 가능(완료) 조각 수로 준비 여부를 판단한다. 전체 조각 수와 혼동하지 않는다."""
+    summary = rag_status_summary()
+    usable = int(summary.get("usable_count") or 0)
+    APP_STATE["rag_chunk_count"] = usable
+    APP_STATE["rag_total_count"] = int(summary.get("total_count") or 0)
+    APP_STATE["rag_incomplete_count"] = int(summary.get("incomplete_count") or 0)
+    APP_STATE["rag_unverified_count"] = int(summary.get("unverified_count") or 0)
+    APP_STATE["rag_status_message"] = summary.get("message") or ""
+    APP_STATE["rag_ready"] = usable > 0
     if processing:
-        APP_STATE["rag_ready"] = chunk_count > 0
-        return chunk_count
-    APP_STATE["rag_ready"] = chunk_count > 0
-    if chunk_count > 0:
+        return usable
+    if usable > 0:
         if APP_STATE.get("rag_stage") in ("idle", None, "error"):
             APP_STATE["rag_stage"] = "ready"
     elif APP_STATE.get("rag_stage") not in ("extracting", "splitting", "embedding"):
-        APP_STATE["rag_stage"] = "idle"
-    return chunk_count
+        if APP_STATE["rag_incomplete_count"] or APP_STATE["rag_unverified_count"]:
+            APP_STATE["rag_stage"] = "error"
+        else:
+            APP_STATE["rag_stage"] = "idle"
+    return usable
 
 
 def _stream_events(events, kind: str | None = None):
@@ -111,10 +118,12 @@ def _stream_events(events, kind: str | None = None):
                 elif etype == "done":
                     count = _sync_rag_state()
                     if event.get("collection_count") is not None:
-                        count = int(event.get("collection_count") or 0)
+                        count = int(event.get("collection_count") or event.get("usable_count") or 0)
                         APP_STATE["rag_chunk_count"] = count
                         APP_STATE["rag_ready"] = count > 0
-                    APP_STATE["rag_stage"] = "ready" if count > 0 else "idle"
+                    APP_STATE["rag_stage"] = "ready" if count > 0 else (
+                        "error" if APP_STATE.get("rag_incomplete_count") or APP_STATE.get("rag_unverified_count") else "idle"
+                    )
                 elif etype == "error":
                     _sync_rag_state()
                     APP_STATE["rag_stage"] = "error" if not APP_STATE["rag_ready"] else "error"
@@ -223,6 +232,10 @@ def status():
         {
             "rag_ready": bool(chunk_count > 0),
             "rag_chunk_count": chunk_count,
+            "rag_total_count": int(APP_STATE.get("rag_total_count") or 0),
+            "rag_incomplete_count": int(APP_STATE.get("rag_incomplete_count") or 0),
+            "rag_unverified_count": int(APP_STATE.get("rag_unverified_count") or 0),
+            "rag_status_message": APP_STATE.get("rag_status_message") or "",
             "rag_stage": APP_STATE.get("rag_stage") or ("ready" if chunk_count > 0 else "idle"),
             "contract_ready": bool(APP_STATE["contract_ready"]),
             "contract_filename": APP_STATE["contract_filename"],

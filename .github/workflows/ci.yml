@@ -1,0 +1,51 @@
+name: CI
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+
+jobs:
+  test:
+    name: Python ${{ matrix.python-version }} / ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        python-version: ["3.11"]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+
+      - name: pip check
+        run: python -m pip check
+
+      - name: Regression tests
+        env:
+          ANONYMIZED_TELEMETRY: "False"
+        run: python -m unittest discover -s tests -v
+
+      - name: Server boot and basic responses
+        env:
+          ANONYMIZED_TELEMETRY: "False"
+        run: python -c "import os; os.environ.setdefault('ANONYMIZED_TELEMETRY','False'); from app import app; c=app.test_client(); r=c.get('/'); assert r.status_code==200; s=c.get('/api/status'); assert s.status_code==200; data=s.get_json(); assert 'rag_ready' in data; assert 'rag_chunk_count' in data; assert 'rag_total_count' in data; print('boot-ok', data.get('rag_ready'), data.get('rag_chunk_count'))"
+
+      - name: JavaScript SSE and UI helper tests
+        run: npm test

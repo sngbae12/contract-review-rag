@@ -16,7 +16,7 @@ from tqdm import tqdm
 
 from config import LLM_MODEL, MIN_REVIEW_LENGTH
 from services.openai_runtime import require_api_key, user_facing_openai_error
-from services.rag_service import rag_document_count, similarity_search
+from services.rag_service import similarity_search, usable_rag_count
 from services.text_split import page_number_from_metadata, split_contract_pages
 
 RetrieveStatus = Literal["ok", "empty", "error"]
@@ -237,7 +237,7 @@ def review_sentences(units: list) -> Generator[dict, None, None]:
     계약서 검토 단위를 하나씩 검토하고, 끝날 때마다 이벤트를 보낸다.
     검색 오류 항목은 LLM 분석을 하지 않는다.
     """
-    if rag_document_count() == 0:
+    if usable_rag_count() == 0:
         yield {
             "type": "error",
             "message": "RAG 문서가 없습니다. 먼저 왼쪽에서 가이드라인/약관 PDF를 업로드하세요.",

@@ -1,4 +1,5 @@
 # virtualenv
+node_modules/
 .venv/
 .venv-verify/
 venv/
@@ -23,6 +24,7 @@ __pycache__/
 # uploaded docs, extracted/review artifacts, vector db
 data/uploads/
 data/chroma_db/
+data/chroma_db_backups/
 data/sample/contract.pdf
 data/sample/guideline.pdf
 

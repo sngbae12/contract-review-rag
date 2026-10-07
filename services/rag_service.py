@@ -1,16 +1,20 @@
+# -*- coding: utf-8 -*-
 """
 RAG 서비스
-- 가이드라인/약관 PDF를 PyPDFLoader로 읽고 분할한 뒤
-- 요청 범위에서만 만든 임베딩 클라이언트로 Chroma에 저장한다.
-- 문서 개수 조회는 로컬 Chroma만 사용하며 OpenAI 키가 필요 없다.
+- 가이드라인/약관 PDF를 분할·임베딩 후 Chroma에 저장한다.
+- 검토용 검색·준비 상태는 문서 전체가 완료된 조각만 사용한다.
+- 구버전 메타데이터는 백업 후 검증 가능한 범위에서만 마이그레이션한다.
 """
 
 from __future__ import annotations
 
 import hashlib
 import logging
+import shutil
 import threading
 import uuid
+from collections import defaultdict
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Generator, Iterable
 
@@ -23,10 +27,13 @@ from langchain_openai import OpenAIEmbeddings
 from tqdm import tqdm
 
 from config import (
+    CHROMA_BACKUP_DIR,
     CHROMA_COLLECTION,
     CHROMA_DIR,
     EMBEDDING_MODEL,
+    RAG_UPLOAD_DIR,
     RETRIEVE_K,
+    SAMPLE_DIR,
 )
 from services.openai_runtime import require_api_key, user_facing_openai_error
 from services.text_split import page_number_from_metadata, split_rag_documents
@@ -35,13 +42,18 @@ logger = logging.getLogger(__name__)
 
 _store_lock = threading.RLock()
 _local_client: chromadb.ClientAPI | None = None
+_migration_done_for: str | None = None
+
+MIGRATION_FLAG = "migration_v1"
+SEARCH_FILTER = {"index_complete": True}
 
 
 def reset_chroma_client() -> None:
     """테스트나 경로 변경 후 로컬 클라이언트를 다시 연다."""
-    global _local_client
+    global _local_client, _migration_done_for
     with _store_lock:
         _local_client = None
+        _migration_done_for = None
 
 
 def _chroma_sqlite_path() -> Path:
@@ -49,7 +61,6 @@ def _chroma_sqlite_path() -> Path:
 
 
 def _make_embeddings() -> OpenAIEmbeddings:
-    """요청 범위의 API 키로만 임베딩 클라이언트를 만든다. 전역에 보관하지 않는다."""
     return OpenAIEmbeddings(model=EMBEDDING_MODEL, api_key=require_api_key())
 
 
@@ -62,7 +73,6 @@ def file_sha256(path: Path) -> str:
 
 
 def _local_chroma_client() -> chromadb.ClientAPI | None:
-    """이미 있는 DB만 연다. 파일이 없으면 클라이언트를 만들지 않는다."""
     global _local_client
     if not _chroma_sqlite_path().exists():
         return None
@@ -73,7 +83,6 @@ def _local_chroma_client() -> chromadb.ClientAPI | None:
 
 
 def get_existing_collection():
-    """컬렉션이 있을 때만 반환한다. 없으면 생성하지 않는다."""
     client = _local_chroma_client()
     if client is None:
         return None
@@ -89,8 +98,84 @@ def get_existing_collection():
         return None
 
 
+def _truthy_complete(value) -> bool:
+    return value is True or value == "true" or value == 1
+
+
+def _has_complete_field(meta: dict | None) -> bool:
+    if not meta:
+        return False
+    return "index_complete" in meta
+
+
+def _group_chunks_by_hash(collection) -> dict[str, list[tuple[str, dict]]]:
+    data = collection.get(include=["metadatas"])
+    groups: dict[str, list[tuple[str, dict]]] = defaultdict(list)
+    for doc_id, meta in zip(data.get("ids") or [], data.get("metadatas") or []):
+        meta = dict(meta or {})
+        content_hash = str(meta.get("content_hash") or "").strip()
+        key = content_hash or f"__id__:{doc_id}"
+        groups[key].append((doc_id, meta))
+    return groups
+
+
+def analyze_document_statuses(collection=None) -> dict:
+    """
+    문서(content_hash) 단위로 완료·미완료·미확인을 판단한다.
+    - 모든 조각이 index_complete=True 인 문서만 usable
+    - 하나라도 False면 incomplete (일부 True만으로 완료 처리하지 않음)
+    - 필드가 전부 없으면 legacy_unverified (검증/마이그레이션 대상)
+    """
+    collection = collection or get_existing_collection()
+    result = {
+        "usable_hashes": set(),
+        "incomplete_hashes": set(),
+        "unverified_hashes": set(),
+        "usable_chunk_ids": [],
+        "incomplete_chunk_ids": [],
+        "unverified_chunk_ids": [],
+        "usable_count": 0,
+        "incomplete_count": 0,
+        "unverified_count": 0,
+        "total_count": 0,
+    }
+    if collection is None:
+        return result
+
+    try:
+        groups = _group_chunks_by_hash(collection)
+    except Exception:
+        logger.warning("chroma analyze failed")
+        return result
+
+    for content_hash, items in groups.items():
+        result["total_count"] += len(items)
+        flags = []
+        for _doc_id, meta in items:
+            if not _has_complete_field(meta):
+                flags.append(None)
+            else:
+                flags.append(_truthy_complete(meta.get("index_complete")))
+
+        ids = [doc_id for doc_id, _ in items]
+        if all(flag is True for flag in flags):
+            result["usable_hashes"].add(content_hash)
+            result["usable_chunk_ids"].extend(ids)
+            result["usable_count"] += len(items)
+        elif any(flag is False for flag in flags):
+            # 일부만 True여도 문서 전체는 미완료
+            result["incomplete_hashes"].add(content_hash)
+            result["incomplete_chunk_ids"].extend(ids)
+            result["incomplete_count"] += len(items)
+        else:
+            result["unverified_hashes"].add(content_hash)
+            result["unverified_chunk_ids"].extend(ids)
+            result["unverified_count"] += len(items)
+    return result
+
+
 def rag_document_count() -> int:
-    """로컬 DB의 조각 수. OpenAI API 키와 임베딩 호출이 필요 없다."""
+    """전체 조각 수(미완료 포함). 상태 진단용."""
     with _store_lock:
         collection = get_existing_collection()
         if collection is None:
@@ -102,33 +187,59 @@ def rag_document_count() -> int:
             return 0
 
 
+def usable_rag_count() -> int:
+    """계약서 검토에 쓸 수 있는 완료 문서의 조각 수."""
+    with _store_lock:
+        ensure_legacy_migration()
+        return int(analyze_document_statuses().get("usable_count") or 0)
+
+
+def rag_status_summary() -> dict:
+    """화면·API용 RAG 상태. ready는 usable 기준."""
+    with _store_lock:
+        ensure_legacy_migration()
+        analysis = analyze_document_statuses()
+    usable = int(analysis["usable_count"])
+    incomplete = int(analysis["incomplete_count"])
+    unverified = int(analysis["unverified_count"])
+    total = int(analysis["total_count"])
+    messages = []
+    if incomplete:
+        messages.append(
+            f"미완료 조각 {incomplete}개가 있어 검토 검색에서 제외했습니다. "
+            "같은 PDF를 다시 업로드하면 전체 인덱싱을 다시 시도할 수 있습니다."
+        )
+    if unverified:
+        messages.append(
+            f"구버전·미확인 조각 {unverified}개는 원본 PDF로 검증되지 않아 검색·중복 방지에 쓰지 않습니다. "
+            "해당 가이드라인 PDF를 다시 업로드해 주세요."
+        )
+    return {
+        "rag_ready": usable > 0,
+        "usable_count": usable,
+        "incomplete_count": incomplete,
+        "unverified_count": unverified,
+        "total_count": total,
+        "message": " ".join(messages),
+        "usable_hashes": set(analysis["usable_hashes"]),
+        "incomplete_hashes": set(analysis["incomplete_hashes"]),
+        "unverified_hashes": set(analysis["unverified_hashes"]),
+    }
+
+
 def existing_content_hashes() -> set[str]:
     """완전히 저장된 문서의 content_hash만 중복으로 본다."""
-    collection = get_existing_collection()
-    if collection is None:
-        return set()
-    try:
-        data = collection.get(include=["metadatas"])
-    except Exception:
-        logger.warning("chroma metadata read failed")
-        return set()
-    hashes: set[str] = set()
-    for meta in data.get("metadatas") or []:
-        if not meta:
-            continue
-        if not meta.get("index_complete"):
-            continue
-        value = meta.get("content_hash")
-        if value:
+    with _store_lock:
+        ensure_legacy_migration()
+        analysis = analyze_document_statuses()
+    hashes = set()
+    for value in analysis["usable_hashes"]:
+        if value and not str(value).startswith("__id__:"):
             hashes.add(str(value))
     return hashes
 
 
 def delete_ids(ids: list[str]) -> dict:
-    """
-    ID 목록을 삭제한다.
-    반환: requested, deleted, remaining, ok
-    """
     unique_ids = list(dict.fromkeys(ids or []))
     result = {
         "requested": len(unique_ids),
@@ -141,7 +252,6 @@ def delete_ids(ids: list[str]) -> dict:
 
     collection = get_existing_collection()
     if collection is None:
-        result["ok"] = True
         return result
 
     try:
@@ -164,7 +274,6 @@ def delete_ids(ids: list[str]) -> dict:
 
 
 def mark_ids_complete(ids: list[str]) -> bool:
-    """저장이 모두 끝난 뒤에만 중복 판정용 완료 표시를 붙인다."""
     if not ids:
         return True
     collection = get_existing_collection()
@@ -200,13 +309,155 @@ def _rollback_message(rollback: dict, api_message: str) -> str:
     return (
         f"이번 업로드 저장에 실패했습니다. 신규 조각 중 {deleted}개는 지웠지만 "
         f"{remaining}개는 남아 있을 수 있습니다. "
-        "상태의 조각 수를 확인한 뒤 같은 파일을 다시 업로드해 주세요. "
+        "미완료 조각은 검토 검색에 쓰이지 않습니다. 같은 파일을 다시 업로드해 주세요. "
         + api_message
     )
 
 
+def _backup_chroma_dir() -> Path | None:
+    if not Path(CHROMA_DIR).exists() or not _chroma_sqlite_path().exists():
+        return None
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    backup_root = Path(CHROMA_BACKUP_DIR)
+    backup_root.mkdir(parents=True, exist_ok=True)
+    target = backup_root / f"chroma_db_{stamp}_{uuid.uuid4().hex[:6]}"
+    shutil.copytree(CHROMA_DIR, target)
+    return target
+
+
+def _discover_pdf_hashes(roots: list[Path]) -> dict[str, Path]:
+    found: dict[str, Path] = {}
+    for root in roots:
+        if not root or not Path(root).exists():
+            continue
+        for path in Path(root).rglob("*.pdf"):
+            try:
+                digest = file_sha256(path)
+            except Exception:
+                continue
+            found.setdefault(digest, path)
+    return found
+
+
+def ensure_legacy_migration() -> dict:
+    """
+    구버전(index_complete 없음) 데이터를 백업 후 처리한다.
+    - 원본 PDF SHA-256으로 검증되면 완료로 표시
+    - 검증 불가면 미확인으로 두고 검색·중복 방지에서 제외
+    - 반복 실행해도 중복 생성·손상 없음
+    """
+    global _migration_done_for
+    marker = str(Path(CHROMA_DIR).resolve())
+    if _migration_done_for == marker:
+        return {"skipped": True, "reason": "already_ran"}
+
+    collection = get_existing_collection()
+    if collection is None:
+        _migration_done_for = marker
+        return {"skipped": True, "reason": "no_collection"}
+
+    analysis = analyze_document_statuses(collection)
+    if not analysis["unverified_chunk_ids"] and not any(
+        str(h).startswith("__id__:") for h in analysis["unverified_hashes"]
+    ):
+        # 미확인이 없어도, 문서 일부만 True인 비정상 상태는 정리
+        repaired = _repair_partial_complete_documents(collection)
+        _migration_done_for = marker
+        return {"skipped": True, "reason": "nothing_unverified", "repaired": repaired}
+
+    backup = _backup_chroma_dir()
+    reset_chroma_client()
+    collection = get_existing_collection()
+    if collection is None:
+        return {"ok": False, "backup": str(backup) if backup else None}
+
+    pdf_hashes = _discover_pdf_hashes([RAG_UPLOAD_DIR, SAMPLE_DIR])
+    analysis = analyze_document_statuses(collection)
+    verified_ids: list[str] = []
+    unverified_ids: list[str] = []
+    verified_hashes: list[str] = []
+    unverified_hashes: list[str] = []
+
+    groups = _group_chunks_by_hash(collection)
+    for content_hash, items in groups.items():
+        flags = []
+        for _doc_id, meta in items:
+            if not _has_complete_field(meta):
+                flags.append(None)
+            else:
+                flags.append(_truthy_complete(meta.get("index_complete")))
+        if any(flag is False for flag in flags) or all(flag is True for flag in flags):
+            continue
+        # legacy: all missing index_complete
+        ids = [doc_id for doc_id, _ in items]
+        if content_hash in pdf_hashes and not str(content_hash).startswith("__id__:"):
+            verified_ids.extend(ids)
+            verified_hashes.append(content_hash)
+        else:
+            unverified_ids.extend(ids)
+            unverified_hashes.append(content_hash)
+
+    if verified_ids:
+        data = collection.get(ids=verified_ids, include=["metadatas"])
+        updated = []
+        for meta in data.get("metadatas") or []:
+            item = dict(meta or {})
+            item["index_complete"] = True
+            item[MIGRATION_FLAG] = "verified_from_pdf"
+            updated.append(item)
+        collection.update(ids=list(data.get("ids") or []), metadatas=updated)
+
+    if unverified_ids:
+        data = collection.get(ids=unverified_ids, include=["metadatas"])
+        updated = []
+        for meta in data.get("metadatas") or []:
+            item = dict(meta or {})
+            # 검색·중복에 쓰지 않도록 False. 원본을 지우지 않고 재업로드 유도.
+            item["index_complete"] = False
+            item[MIGRATION_FLAG] = "unverified_needs_reindex"
+            updated.append(item)
+        collection.update(ids=list(data.get("ids") or []), metadatas=updated)
+
+    repaired = _repair_partial_complete_documents(collection)
+    reset_chroma_client()
+    _migration_done_for = marker
+    return {
+        "ok": True,
+        "backup": str(backup) if backup else None,
+        "verified_hashes": verified_hashes,
+        "unverified_hashes": unverified_hashes,
+        "verified_chunks": len(verified_ids),
+        "unverified_chunks": len(unverified_ids),
+        "repaired": repaired,
+    }
+
+
+def _repair_partial_complete_documents(collection) -> int:
+    """같은 content_hash에 True/False가 섞이면 문서 전체를 미완료로 맞춘다."""
+    repaired = 0
+    groups = _group_chunks_by_hash(collection)
+    for _content_hash, items in groups.items():
+        flags = []
+        for _doc_id, meta in items:
+            if not _has_complete_field(meta):
+                flags.append(None)
+            else:
+                flags.append(_truthy_complete(meta.get("index_complete")))
+        if True in flags and False in flags:
+            ids = [doc_id for doc_id, _ in items]
+            data = collection.get(ids=ids, include=["metadatas"])
+            updated = []
+            for meta in data.get("metadatas") or []:
+                item = dict(meta or {})
+                item["index_complete"] = False
+                item["index_note"] = "partial_complete_downgraded"
+                updated.append(item)
+            collection.update(ids=list(data.get("ids") or []), metadatas=updated)
+            repaired += len(ids)
+    return repaired
+
+
 def _vectorstore_for_write() -> Chroma:
-    """이번 저장 작업에서만 임베딩 클라이언트를 붙인다."""
     return Chroma(
         collection_name=CHROMA_COLLECTION,
         embedding_function=_make_embeddings(),
@@ -217,6 +468,8 @@ def _vectorstore_for_write() -> Chroma:
 
 def _vectorstore_for_search() -> Chroma | None:
     if get_existing_collection() is None:
+        return None
+    if usable_rag_count() == 0:
         return None
     client = _local_chroma_client()
     if client is None:
@@ -230,15 +483,30 @@ def _vectorstore_for_search() -> Chroma | None:
 
 
 def similarity_search(query: str, k: int = RETRIEVE_K) -> list[Document]:
-    """
-    유사 조각 검색.
-    컬렉션이 없거나 결과가 없으면 빈 목록.
-    임베딩/검색 호출 실패는 예외로 올린다.
-    """
+    """완료된 문서 조각만 검색한다."""
+    with _store_lock:
+        ensure_legacy_migration()
     store = _vectorstore_for_search()
     if store is None:
         return []
-    return store.similarity_search(query, k=k)
+    # 여유 있게 가져온 뒤, 문서 단위로 다시 걸러 일부 완료 표시 오용을 막는다.
+    fetch_k = max(k * 3, k)
+    docs = store.similarity_search(query, k=fetch_k, filter=SEARCH_FILTER)
+    usable = existing_content_hashes()
+    filtered = []
+    for doc in docs:
+        meta = doc.metadata or {}
+        if not _truthy_complete(meta.get("index_complete")):
+            continue
+        content_hash = str(meta.get("content_hash") or "")
+        if content_hash and content_hash not in usable:
+            continue
+        if not content_hash:
+            continue
+        filtered.append(doc)
+        if len(filtered) >= k:
+            break
+    return filtered
 
 
 def _clean_metadata(metadata: dict) -> dict:
@@ -272,6 +540,7 @@ def index_pdfs(
     failure_reported = False
 
     try:
+        ensure_legacy_migration()
         yield {
             "type": "progress",
             "stage": "extracting",
@@ -279,6 +548,7 @@ def index_pdfs(
         }
 
         known_hashes = existing_content_hashes()
+        batch_seen_hashes: set[str] = set()
         raw_docs: list[Document] = []
         failed_extract: list[str] = []
         skipped_duplicates: list[str] = []
@@ -286,12 +556,17 @@ def index_pdfs(
 
         for path, original in zip(paths, names):
             content_hash = file_sha256(path)
-            if content_hash in known_hashes:
+            if content_hash in known_hashes or content_hash in batch_seen_hashes:
                 skipped_duplicates.append(original)
+                reason = (
+                    "이미 저장된 내용과 같아"
+                    if content_hash in known_hashes
+                    else "이번 업로드 안에서 같은 내용이 있어"
+                )
                 yield {
                     "type": "progress",
                     "stage": "extracting",
-                    "message": f"{original} 은(는) 이미 저장된 내용과 같아 건너뜁니다.",
+                    "message": f"{original} 은(는) {reason} 건너뜁니다.",
                 }
                 continue
             try:
@@ -308,6 +583,7 @@ def index_pdfs(
                 continue
 
             page_docs = 0
+            page_local: list[Document] = []
             for doc in loaded:
                 if not doc.page_content or not doc.page_content.strip():
                     continue
@@ -315,13 +591,12 @@ def index_pdfs(
                 meta["source_file"] = original
                 meta["content_hash"] = content_hash
                 meta["upload_job_id"] = job_id
-                # 완전히 끝난 뒤에만 True로 바꾼다. 불완전 저장은 중복으로 보지 않는다.
                 meta["index_complete"] = False
                 page = page_number_from_metadata(meta)
                 if page is not None:
                     meta["page"] = page
                 doc.metadata = _clean_metadata(meta)
-                raw_docs.append(doc)
+                page_local.append(doc)
                 page_docs += 1
 
             if page_docs == 0:
@@ -333,7 +608,10 @@ def index_pdfs(
                 }
                 continue
 
+            # 추출에 성공한 뒤에만 배치 내 중복으로 본다. 완료 문서 해시는 저장 성공 후에만 known에 반영된다.
+            batch_seen_hashes.add(content_hash)
             accepted_names.append(original)
+            raw_docs.extend(page_local)
             yield {
                 "type": "progress",
                 "stage": "extracting",
@@ -352,23 +630,32 @@ def index_pdfs(
                 }
                 failure_reported = True
                 return
-            collection_count = rag_document_count()
+            summary = rag_status_summary()
+            collection_count = summary["usable_count"]
             skip_note = (
-                f"이미 저장된 문서 {len(skipped_duplicates)}개를 건너뛰었습니다."
+                f"중복으로 건너뛴 파일 {len(skipped_duplicates)}개: "
+                + ", ".join(skipped_duplicates)
                 if skipped_duplicates
                 else "추가할 새 조각이 없습니다."
             )
             fail_note = (
                 f"\n추출 실패: {', '.join(failed_extract)}" if failed_extract else ""
             )
+            extra_status = f"\n{summary['message']}" if summary.get("message") else ""
             done_event = {
                 "type": "done",
                 "stage": "ready" if collection_count > 0 else "idle",
                 "percent": 100,
-                "message": f"{skip_note}{fail_note}\n- 총 조각: {collection_count}개",
+                "message": (
+                    f"{skip_note}{fail_note}{extra_status}\n"
+                    f"- 검토 가능 조각: {collection_count}개\n"
+                    f"- 전체 조각: {summary['total_count']}개"
+                ),
                 "file_count": 0,
                 "chunk_count": 0,
                 "collection_count": collection_count,
+                "usable_count": collection_count,
+                "total_count": summary["total_count"],
                 "skipped_duplicates": skipped_duplicates,
                 "failed_files": failed_extract,
             }
@@ -411,7 +698,6 @@ def index_pdfs(
             for start in range(0, total, batch_size):
                 batch = chunks[start : start + batch_size]
                 ids = [f"{job_id}:{start + offset:06d}" for offset in range(len(batch))]
-                # 저장 호출 전에 ID를 추적한다. 배치 일부만 들어가도 롤백 대상에 포함한다.
                 added_ids.extend(ids)
                 try:
                     with _store_lock:
@@ -458,7 +744,8 @@ def index_pdfs(
             return
 
         reset_chroma_client()
-        collection_count = rag_document_count()
+        summary = rag_status_summary()
+        collection_count = summary["usable_count"]
         extra_fail = (
             f"\n추출 실패(인덱싱하지 않음): {', '.join(failed_extract)}"
             if failed_extract
@@ -469,24 +756,27 @@ def index_pdfs(
             if skipped_duplicates
             else ""
         )
+        extra_status = f"\n{summary['message']}" if summary.get("message") else ""
         done_event = {
             "type": "done",
-            "stage": "ready",
+            "stage": "ready" if collection_count > 0 else "idle",
             "percent": 100,
             "message": (
                 f"RAG 인덱싱이 완료되었습니다.\n"
                 f"- 파일: {', '.join(accepted_names)}\n"
                 f"- 이번 업로드 조각: {total}개\n"
-                f"- 총 조각: {collection_count}개"
-                f"{extra_skip}{extra_fail}"
+                f"- 검토 가능 조각: {collection_count}개\n"
+                f"- 전체 조각: {summary['total_count']}개"
+                f"{extra_skip}{extra_fail}{extra_status}"
             ),
             "file_count": len(accepted_names),
             "chunk_count": total,
             "collection_count": collection_count,
+            "usable_count": collection_count,
+            "total_count": summary["total_count"],
             "skipped_duplicates": skipped_duplicates,
             "failed_files": failed_extract,
         }
-        # done을 보내기 전에 성공을 확정한다. 클라이언트가 직후 연결을 닫아도 롤백하지 않는다.
         committed = True
         yield done_event
     except Exception as exc:

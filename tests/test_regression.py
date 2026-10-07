@@ -169,12 +169,15 @@ class FrontendSourceTests(unittest.TestCase):
         cls.js = (ROOT / "static" / "js" / "app.js").read_text(encoding="utf-8")
 
     def test_filenames_use_text_message(self):
+        sse = (ROOT / "static" / "js" / "sse_utils.js").read_text(encoding="utf-8")
         self.assertIn('addTextMessage("user", `RAG 파일 업로드: ${names}`)', self.js)
         self.assertIn('addTextMessage("user", `계약서 업로드: ${file.name}`)', self.js)
         self.assertNotIn('addMessage("user", `RAG', self.js)
-        self.assertIn("INCOMPLETE_STREAM", self.js)
-        self.assertIn("event.isComposing || event.keyCode === 229", self.js)
-        self.assertIn('event.key === "Enter" && !event.shiftKey', self.js)
+        self.assertIn("ContractReviewSse", self.js)
+        self.assertIn("shouldSubmitOnEnter", sse)
+        self.assertIn("event.isComposing || event.keyCode === 229", sse)
+        self.assertIn('event.key === "Enter" && !event.shiftKey', sse)
+        self.assertIn("INCOMPLETE_STREAM", sse)
         self.assertIn("localStorage", (ROOT / "templates" / "index.html").read_text(encoding="utf-8"))
 
     def test_no_innerhtml_for_user_upload_names(self):
@@ -193,7 +196,7 @@ class ReviewFlowTests(unittest.TestCase):
             llm_calls["n"] += 1
             raise AssertionError("LLM should not run")
 
-        with patch.object(review_agent, "rag_document_count", return_value=3), patch.object(
+        with patch.object(review_agent, "usable_rag_count", return_value=3), patch.object(
             review_agent, "similarity_search", side_effect=RuntimeError("search down")
         ), patch.object(review_agent, "_llm", side_effect=boom_llm):
             events = _events(review_agent.review_sentences(["이 조항은 충분히 긴 계약 내용입니다."]))
@@ -210,7 +213,7 @@ class ReviewFlowTests(unittest.TestCase):
     def test_empty_search_is_no_evidence(self):
         from services import review_agent
 
-        with patch.object(review_agent, "rag_document_count", return_value=3), patch.object(
+        with patch.object(review_agent, "usable_rag_count", return_value=3), patch.object(
             review_agent, "similarity_search", return_value=[]
         ), patch.object(review_agent, "_llm", side_effect=AssertionError("LLM should not run")):
             events = _events(review_agent.review_sentences(["이 조항은 충분히 긴 계약 내용입니다."]))
@@ -224,7 +227,7 @@ class ReviewFlowTests(unittest.TestCase):
     def test_successful_search_runs_analysis(self):
         from services import review_agent
 
-        with patch.object(review_agent, "rag_document_count", return_value=3), patch.object(
+        with patch.object(review_agent, "usable_rag_count", return_value=3), patch.object(
             review_agent,
             "similarity_search",
             return_value=[Document(page_content="지급 기한", metadata={"source_file": "g.pdf", "page": 1})],

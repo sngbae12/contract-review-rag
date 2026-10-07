@@ -19,6 +19,12 @@ const contractStatus = document.getElementById("contract-status");
 const composerHint = document.getElementById("composer-hint");
 const apiKeyInput = document.getElementById("openai-api-key");
 
+const Sse = window.ContractReviewSse;
+const INCOMPLETE_STREAM = Sse.INCOMPLETE_STREAM;
+const handleSseBuffer = Sse.handleSseBuffer;
+const parseSseBlock = Sse.parseSseBlock;
+const consumeSSE = Sse.consumeSSE;
+
 const ui = {
   ragUploading: false,
   contractUploading: false,
@@ -28,11 +34,14 @@ const ui = {
   contractStage: "idle",
   ragReady: false,
   ragChunkCount: 0,
+  ragTotalCount: 0,
+  ragIncompleteCount: 0,
+  ragUnverifiedCount: 0,
+  ragStatusMessage: "",
   contractReady: false,
   contractFilename: "",
 };
 
-const INCOMPLETE_STREAM = "연결이 완료 신호 없이 종료되었습니다. 작업이 중단되었을 수 있습니다.";
 
 function getApiKey() {
   return apiKeyInput ? apiKeyInput.value.trim() : "";
@@ -87,6 +96,9 @@ function stageLabel(kind, stage, ready, extra) {
   if (stage === "error") return ready ? "준비됨 · 마지막 처리 실패" : "처리 실패";
   if (kind === "rag") {
     if (ready) return extra ? `준비 완료 (${extra}조각)` : "준비 완료";
+    if (ui.ragIncompleteCount || ui.ragUnverifiedCount) {
+      return "미완료·재업로드 필요";
+    }
     return "대기 중";
   }
   if (ready) return extra || "준비 완료";
@@ -95,6 +107,7 @@ function stageLabel(kind, stage, ready, extra) {
 
 function renderSidebarStatus() {
   ragStatus.textContent = stageLabel("rag", ui.ragStage, ui.ragReady, ui.ragChunkCount);
+  ragStatus.title = ui.ragStatusMessage || "";
   contractStatus.textContent = stageLabel(
     "contract",
     ui.contractStage,
@@ -198,77 +211,6 @@ function appendStreamNote(bubble, text) {
   return note;
 }
 
-function parseSseBlock(part) {
-  const line = part.split("\n").find((item) => item.startsWith("data: "));
-  if (!line) return null;
-  return JSON.parse(line.slice(6));
-}
-
-function handleSseBuffer(chunk, onEvent) {
-  const parts = chunk.split("\n\n");
-  const rest = parts.pop();
-  for (const part of parts) {
-    let event;
-    try {
-      event = parseSseBlock(part);
-    } catch (_err) {
-      throw new Error("서버 응답 형식을 해석하지 못했습니다.");
-    }
-    if (!event) continue;
-    try {
-      onEvent(event);
-    } catch (err) {
-      console.error(err);
-    }
-    if (event.type === "done" || event.type === "error") {
-      return { rest: "", terminal: event };
-    }
-  }
-  return { rest, terminal: null };
-}
-
-/** 서버가 보낸 SSE를 읽고, done/error에서 종료한다. 완료 이벤트 없이 끝나면 오류다. */
-async function consumeSSE(response, onEvent) {
-  if (!response.ok || !response.body) {
-    let message = `요청 실패 (${response.status})`;
-    try {
-      const data = await response.json();
-      if (data.message) message = data.message;
-    } catch (_err) {
-      /* JSON이 아니면 기본 메시지 사용 */
-    }
-    throw new Error(message);
-  }
-
-  const reader = response.body.getReader();
-  const decoder = new TextDecoder("utf-8");
-  let buffer = "";
-
-  try {
-    while (true) {
-      const { value, done } = await reader.read();
-      if (done) {
-        buffer += decoder.decode();
-        if (buffer.trim()) {
-          const parsed = handleSseBuffer(`${buffer}\n\n`, onEvent);
-          if (parsed.terminal) return parsed.terminal;
-        }
-        throw new Error(INCOMPLETE_STREAM);
-      }
-      buffer += decoder.decode(value, { stream: true });
-      const parsed = handleSseBuffer(buffer, onEvent);
-      buffer = parsed.rest;
-      if (parsed.terminal) return parsed.terminal;
-    }
-  } finally {
-    try {
-      await reader.cancel();
-    } catch (_err) {
-      /* 이미 닫힌 스트림 */
-    }
-  }
-}
-
 function scrollToBottom() {
   chatLog.scrollTop = chatLog.scrollHeight;
 }
@@ -290,11 +232,18 @@ async function refreshStatus() {
   const data = await res.json();
   ui.ragReady = Boolean(data.rag_ready);
   ui.ragChunkCount = data.rag_chunk_count || 0;
+  ui.ragTotalCount = data.rag_total_count || 0;
+  ui.ragIncompleteCount = data.rag_incomplete_count || 0;
+  ui.ragUnverifiedCount = data.rag_unverified_count || 0;
+  ui.ragStatusMessage = data.rag_status_message || "";
   ui.ragStage = data.rag_stage || (ui.ragReady ? "ready" : "idle");
   ui.contractReady = Boolean(data.contract_ready);
   ui.contractFilename = data.contract_filename || "";
   ui.contractStage = data.contract_stage || (ui.contractReady ? "ready" : "idle");
   renderSidebarStatus();
+  if (ui.ragStatusMessage && !ui.ragReady) {
+    // 미완료·미확인만 있을 때 한 번 안내 (중복 스팸 방지를 위해 상태 카드에 반영)
+  }
 }
 
 btnRag.addEventListener("click", () => {
@@ -604,11 +553,9 @@ chatForm.addEventListener("submit", (event) => {
 });
 
 questionBox.addEventListener("keydown", (event) => {
-  if (event.isComposing || event.keyCode === 229) return;
-  if (event.key === "Enter" && !event.shiftKey) {
-    event.preventDefault();
-    submitQuestion();
-  }
+  if (!Sse.shouldSubmitOnEnter(event)) return;
+  event.preventDefault();
+  submitQuestion();
 });
 
 questionBox.addEventListener("input", autoResize);

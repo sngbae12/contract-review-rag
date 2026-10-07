@@ -87,13 +87,18 @@ services/review_agent.py     계약서 분할·검토
 services/text_split.py       RAG/계약서 분할
 services/chat_service.py     일반 질문
 services/openai_runtime.py   요청·스트림 단위 API 키
-tests/                 테스트 대역 회귀 테스트
+tests/                 Python 회귀 테스트
+tests/js/              Node.js SSE·키보드 헬퍼 테스트
+static/js/sse_utils.js DOM 없이 검증 가능한 SSE 유틸
+.github/workflows/ci.yml  GitHub Actions 자동 검증
+package.json           Node 테스트 스크립트
 data/sample/           가상 예시 PDF
 data/uploads/          실행 중 업로드 파일 로컬 저장
 data/chroma_db/        실행 중 벡터 DB 로컬 저장
+data/chroma_db_backups/ 구버전 메타데이터 마이그레이션 백업
 ```
 
-`data/uploads`와 `data/chroma_db`는 Git에 올리지 않습니다.
+`data/uploads`, `data/chroma_db`, `data/chroma_db_backups`는 Git에 올리지 않습니다.
 
 ## 6. 내려받기와 설치
 
@@ -106,7 +111,25 @@ python -m venv .venv
 .venv\Scripts\python -m pip install -r requirements.txt
 ```
 
-가상환경 없이 전역 Python을 써도 됩니다. `start.bat`은 `.venv`가 있으면 그 Python을 먼저 사용합니다.
+가상환경 없이 전역 Python을 써도 됩니다. `start.bat`은 프로젝트 폴더의 `.venv\Scripts\python.exe`가 있으면 그 Python을 먼저 사용합니다. 필요한 `data/uploads`, `data/chroma_db` 폴더는 앱 시작 시 자동으로 만들어집니다. 경로에 공백·한글이 있어도 프로젝트 루트 기준 상대 경로로 파일을 찾습니다.
+
+자동 테스트:
+
+```bat
+.venv\Scripts\python -m unittest discover -s tests -v
+npm test
+```
+
+Node.js 18 이상이 필요합니다(프론트 SSE 유틸 테스트). Python 테스트는 API 키 없이 실행됩니다.
+
+기존 사용자 업데이트:
+
+```bat
+git pull origin master
+.venv\Scripts\python -m pip install -r requirements.txt
+```
+
+서버를 다시 시작하면 구버전 Chroma 메타데이터 마이그레이션이 필요할 때 `data/chroma_db_backups`에 백업을 만든 뒤 처리합니다. 원본 PDF SHA-256으로 검증된 문서만 완료로 표시하고, 검증되지 않은 조각은 검색·중복 방지에서 제외한 채 재업로드를 안내합니다. DB와 업로드 PDF를 임의로 삭제하지 않습니다.
 
 ## 7. API 준비와 실행
 
@@ -125,7 +148,7 @@ python -m venv .venv
 - 계약서 검토: 검색 쿼리(검토 단위 텍스트)가 임베딩 API로 나가고, 검색에 성공한 항목만 계약서 내용과 검색된 가이드라인 조각이 채팅 API로 전송됩니다.
 - 일반 질문: 질문 문장과 고정 시스템 프롬프트가 채팅 API로 전송됩니다.
 
-상태 조회(`/api/status`)와 저장된 조각 수 확인은 로컬 Chroma만 읽으며 OpenAI를 호출하지 않습니다.
+상태 조회(`/api/status`)는 로컬 Chroma만 읽으며 OpenAI를 호출하지 않습니다. `rag_ready`와 `rag_chunk_count`는 검토에 쓸 수 있는 완료 문서 조각 수 기준이고, `rag_total_count`·`rag_incomplete_count`·`rag_unverified_count`로 전체·미완료·미확인을 구분합니다.
 
 실행:
 
@@ -147,13 +170,13 @@ start.bat
 
 1. 브라우저에서 키를 입력합니다. RAG 데이터가 이미 있으면 키 입력 전에도 왼쪽 상태에 조각 수가 표시됩니다.
 2. [RAG 파일 업로드]로 `data/sample/virtual_guideline.pdf` 같은 가이드라인 PDF를 올립니다. 여러 개를 한 번에 고를 수 있습니다.
-3. 여러 PDF를 함께 올릴 때: 추출에 성공하고 내용이 새로운 파일만 인덱싱합니다. 추출 실패 파일은 건너뛰고 결과에 이름을 적습니다. 내용 해시가 같은 파일은 중복으로 건너뜁니다. 임베딩·저장 중 실패하면 이번 작업에서 새로 넣은 조각만 지우고, 이전에 성공한 문서는 그대로 둡니다.
+3. 여러 PDF를 함께 올릴 때: 추출에 성공하고 내용이 새로운 파일만 인덱싱합니다. 기존 DB에 완료 저장된 내용뿐 아니라, 같은 업로드 안에서 SHA-256이 같은 파일도 한 번만 저장하고 건너뛴 이름을 결과에 표시합니다. 내용이 다른 파일은 함께 처리합니다. 추출·저장에 실패한 파일은 완료 중복으로 취급하지 않습니다. 임베딩·저장 중 실패하면 이번 작업에서 저장을 시도한 조각만 지우고, 이전에 성공한 문서는 그대로 둡니다. 미완료 조각만 남으면 RAG는 준비되지 않은 상태로 두고 검색에도 쓰지 않습니다.
 4. 처리 중에도 질문 초안은 작성할 수 있습니다. 전송은 답변 생성 중에만 막힙니다.
 5. [계약서 업로드]로 `data/sample/virtual_contract.pdf` 같은 계약서 PDF를 올립니다.
 6. 업로드가 끝나면 [계약서 검토]가 나타납니다. 단위마다 원문이 나오고, 검색에 성공해 모델이 이슈가 있다고 판단하면 수정문구와 사유가 붙습니다. 검색 실패·근거 부족은 정상 검토나 “문제없음”으로 표시하지 않습니다.
 7. 일반 질문은 입력 후 전송 버튼 또는 Enter로 보냅니다. Shift+Enter는 줄바꿈입니다. 한글 IME 조합 중 Enter는 전송하지 않도록 코드에 `isComposing`과 keyCode 229 처리가 있습니다.
 
-같은 이름으로 계약서를 다시 올릴 때, 새 파일이 실패하면 이전에 성공한 검토 단위 목록은 그대로 둡니다. 디스크에 저장할 때는 UUID를 붙이지만, 중복 여부는 원본 PDF 바이트의 SHA-256과 `index_complete=true`인 조각만으로 판단합니다. 저장이 중간에 실패해 남은 불완전 조각은 중복으로 보지 않으며, 같은 PDF를 다시 올려 전체 인덱싱할 수 있습니다.
+같은 이름으로 계약서를 다시 올릴 때, 새 파일이 실패하면 이전에 성공한 검토 단위 목록은 그대로 둡니다. 디스크에 저장할 때는 UUID를 붙이지만, RAG 중복 여부는 원본 PDF 바이트의 SHA-256과 문서 전체가 완료(`index_complete=true`)인 경우만으로 판단합니다. 일부 조각만 완료 표시된 문서는 완료로 보지 않습니다. 불완전 조각은 검토 검색에서 제외되며, 같은 PDF를 다시 올려 전체 인덱싱할 수 있습니다.
 
 RAG 인덱싱이 성공으로 확정된 뒤에야 완료(`done`) 이벤트를 보냅니다. 클라이언트가 완료 직후 SSE 연결을 닫아도 성공한 데이터는 지우지 않습니다. 완료 이전 실패·취소는 이번 작업에서 저장을 시도한 신규 ID만 정리합니다.
 
@@ -174,6 +197,9 @@ RAG 인덱싱이 성공으로 확정된 뒤에야 완료(`done`) 이벤트를 �
 - 긴 조항을 나눌 때와 페이지를 넘길 때 조항 번호는 메타데이터로만 이어받고, 원문에 번호를 다시 넣지 않습니다.
 - 파일명과 서버 메시지를 `innerHTML`에 넣던 경로는 `textContent`와 고정된 진행 UI로 분리했습니다.
 - SSE가 `done`/`error` 없이 끝나도 정상 반환하던 문제는 중단 오류로 처리하도록 바꿨습니다.
+- 롤백까지 실패한 미완료 조각이 검색·준비 상태에 쓰이던 문제를, 문서 단위 완료 판정과 검색 필터로 막았습니다.
+- 한 번의 업로드에 동일 내용 PDF가 여러 개 있으면 배치 내부 SHA-256으로 한 번만 인덱싱합니다.
+- 구버전 DB에 `index_complete`가 없으면 백업 후 원본 PDF 해시로 검증된 문서만 완료 처리하고, 미확인은 재업로드를 안내합니다.
 - 13MB짜리 기존 샘플 PDF는 이미지 비중이 커서 Git에 넣지 않았습니다. 가상 텍스트 PDF를 `data/sample/virtual_*.pdf`로 추가했습니다.
 
 ## 10. 성능, 한계, 향후 개선
@@ -193,31 +219,26 @@ RAG 인덱싱이 성공으로 확정된 뒤에야 완료(`done`) 이벤트를 �
 
 ## 11. 검증 결과와 미검증 항목
 
-별도 가상환경 `.venv-verify`(Python 3.11.9)에서 의존성을 설치한 뒤, 이번 수정 후 `python -m unittest discover -s tests -v`를 실행했습니다(28개 통과).
+로컬(개발 트리)과 한글·공백이 포함된 새 작업 폴더의 깨끗한 가상환경에서 `pip install -r requirements.txt`, `pip check`, `python -m unittest discover -s tests -v`(38개 통과), `npm test`(7개 통과), Flask `/`·`/api/status` 초기 응답을 확인했습니다. GitHub Actions(`.github/workflows/ci.yml`)는 push/PR 시 Ubuntu·Windows + Python 3.11에서 같은 항목을 실행합니다.
 
-테스트 대역 검증(임시 Chroma DB + DeterministicFakeEmbedding, 실제 OpenAI 호출 없음):
+테스트 대역 검증(임시 Chroma + DeterministicFakeEmbedding, 실제 OpenAI 호출 없음):
 
-- 정상 샘플 PDF 분할, 손상된 PDF 업로드 후 기존 계약서 유지
-- 로컬 Chroma를 만든 뒤 API 키 없이 `/api/status`에서 조각 수 복구, 빈 경로에서는 컬렉션 미생성
-- 검색 예외 시 LLM 미호출·검토 실패 표시, 검색 결과 없음과 구분
-- `done` 직후 제너레이터 close 및 Flask SSE 응답 종료 후에도 성공 데이터 유지
-- 완료 이전 취소 시 신규 데이터만 정리, 기존 문서 유지
-- 현재 배치 일부 저장 후 예외 시 신규 ID 전체 정리
-- 실패 후 같은 PDF 재업로드 성공, 정상 완료본만 중복 건너뜀
-- 롤백 실패 시 “모두 되돌림”이 아닌 잔여·재시도 안내
-- 본문 조항 참조와 실제 제목 구분, 긴 조항·페이지 넘김 시 조항 번호 메타데이터 보존
-- 파일명을 `textContent`로 넣는 코드 경로, SSE 정상 완료·명시적 오류·중간 종료 파서
-- 키 없이 RAG·검토·질문 요청 시 400
-- 소스에 Enter / Shift+Enter / 한글 IME(`isComposing`, keyCode 229) 처리가 있는지 확인
+- 미완료 조각만 있을 때 `rag_ready=false`, 검색 결과에서 제외
+- 정상·실패 데이터가 섞이면 완료 문서만 검색
+- 동일 내용 파일 동시 업로드 시 한 번만 저장, 서로 다른 파일 다중 업로드 정상
+- 구버전 메타데이터: 원본 PDF로 검증 시 완료 승격, 미확인은 제외·재인덱싱 가능, 마이그레이션 반복 시 조각 수 유지
+- 문서 일부만 `index_complete=true`이면 해당 문서는 미완료
+- `done` 직후 연결 종료·완료 전 취소·배치 일부 실패 롤백·실패 후 재업로드
+- 조항 참조/제목 구분, 긴 조항·페이지 넘김 조항 번호, 검색 실패 시 LLM 미호출
+- 업로드→상태→계약서→검토→채팅 전체 흐름(모델·임베딩은 대역)
+- Node에서 실제 `sse_utils.js`의 SSE 완료/오류/중단, Enter·IME, 버튼 플래그 해제
 
-실제 OpenAI 호출: 이번 수정 작업에서는 호출하지 않았습니다. 미검증입니다.
+실제 OpenAI 호출: 이번 작업에서 호출하지 않았습니다. 미검증입니다.
 
-브라우저에서 직접 확인하지 못한 항목:
+브라우저 UI를 손으로 조작한 확인은 하지 않았습니다(미검증): 실제 화면에서의 전송 버튼·IME 입력감, 처리 중 초안 작성 UX.
 
-- 전송 버튼·Enter·Shift+Enter·한글 IME 조합의 실제 입력
-- 처리 중 질문 초안 작성 UI
-- 버튼이 화면에서 영구적으로 잠기는지(코드상 `finally`에서 해제)
+macOS에서의 설치·실행은 이 작업에서 검증하지 않았습니다. CI는 Ubuntu·Windows만 돌립니다.
 
-응답 시간과 정확도 수치는 측정하지 않았습니다.
+응답 시간·정확도 수치는 측정하지 않았습니다.
 
 라이선스 파일은 코드와 모델 이용 조건을 이 작업에서 확인하지 않아 넣지 않았습니다.
