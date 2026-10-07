@@ -174,6 +174,7 @@ def analyze_document_statuses(collection=None) -> dict:
         "usable_hashes": set(),
         "incomplete_hashes": set(),
         "unverified_hashes": set(),
+        "usable_job_keys": set(),
         "usable_chunk_ids": [],
         "incomplete_chunk_ids": [],
         "unverified_chunk_ids": [],
@@ -215,6 +216,10 @@ def analyze_document_statuses(collection=None) -> dict:
             result["usable_hashes"].add(content_hash)
             result["usable_chunk_ids"].extend(complete_ids)
             result["usable_count"] += len(complete_ids)
+            for job_id, items in jobs.items():
+                statuses = [status for _doc_id, _meta, status in items]
+                if statuses and all(status == STATUS_COMPLETE for status in statuses):
+                    result["usable_job_keys"].add((content_hash, job_id))
         if incomplete_ids:
             result["incomplete_hashes"].add(content_hash)
             result["incomplete_chunk_ids"].extend(incomplete_ids)
@@ -291,6 +296,54 @@ def existing_content_hashes() -> set[str]:
     return hashes
 
 
+def chroma_max_batch_size() -> int:
+    """현재 Chroma 클라이언트의 최대 배치 크기. 환경마다 다를 수 있어 고정값으로 가정하지 않는다."""
+    client = _local_chroma_client()
+    if client is not None:
+        try:
+            value = int(client.get_max_batch_size())
+            if value > 0:
+                return value
+        except Exception:
+            logger.warning("chroma get_max_batch_size failed on persistent client")
+    try:
+        value = int(chromadb.Client().get_max_batch_size())
+        if value > 0:
+            return value
+    except Exception:
+        logger.warning("chroma get_max_batch_size failed on ephemeral client")
+    return 512
+
+
+def _batched_slices(items: list, batch_size: int | None = None):
+    size = max(1, int(batch_size or chroma_max_batch_size()))
+    for start in range(0, len(items), size):
+        yield start, items[start : start + size]
+
+
+def _get_metadatas_by_ids(collection, ids: list[str]) -> tuple[list[str], list[dict]]:
+    found_ids: list[str] = []
+    metadatas: list[dict] = []
+    for _start, batch_ids in _batched_slices(ids):
+        data = collection.get(ids=batch_ids, include=["metadatas"])
+        found_ids.extend(list(data.get("ids") or []))
+        metadatas.extend([dict(meta or {}) for meta in (data.get("metadatas") or [])])
+    return found_ids, metadatas
+
+
+def _update_metadatas_batched(collection, ids: list[str], metadatas: list[dict]) -> bool:
+    if len(ids) != len(metadatas):
+        return False
+    try:
+        for start, batch_ids in _batched_slices(ids):
+            batch_metas = metadatas[start : start + len(batch_ids)]
+            collection.update(ids=batch_ids, metadatas=batch_metas)
+        return True
+    except Exception:
+        logger.warning("chroma batched update failed count=%s", len(ids))
+        return False
+
+
 def delete_ids(ids: list[str]) -> dict:
     unique_ids = list(dict.fromkeys(ids or []))
     result = {
@@ -307,14 +360,17 @@ def delete_ids(ids: list[str]) -> dict:
         return result
 
     try:
-        collection.delete(ids=unique_ids)
+        for _start, batch_ids in _batched_slices(unique_ids):
+            collection.delete(ids=batch_ids)
     except Exception:
         logger.warning("chroma delete failed count=%s", len(unique_ids))
         result["ok"] = False
 
+    remaining: list[str] = []
     try:
-        remaining_data = collection.get(ids=unique_ids, include=[])
-        remaining = list(remaining_data.get("ids") or [])
+        for _start, batch_ids in _batched_slices(unique_ids):
+            remaining_data = collection.get(ids=batch_ids, include=[])
+            remaining.extend(list(remaining_data.get("ids") or []))
     except Exception:
         remaining = unique_ids
         result["ok"] = False
@@ -325,27 +381,50 @@ def delete_ids(ids: list[str]) -> dict:
     return result
 
 
+def _force_ids_incomplete(collection, ids: list[str]) -> None:
+    """완료 표시 중 실패 시 해당 작업 조각을 전부 미완료로 되돌린다."""
+    try:
+        found_ids, metadatas = _get_metadatas_by_ids(collection, ids)
+        if not found_ids:
+            return
+        updated = []
+        for meta in metadatas:
+            item = dict(meta or {})
+            item["index_complete"] = False
+            item["index_note"] = "mark_complete_reverted"
+            updated.append(item)
+        _update_metadatas_batched(collection, found_ids, updated)
+    except Exception:
+        logger.warning("force incomplete after mark failure failed count=%s", len(ids))
+
+
 def mark_ids_complete(ids: list[str]) -> bool:
+    """Chroma 배치 한도에 맞춰 완료 표시. 중간 실패 시 작업 전체를 미완료로 되돌린다."""
     if not ids:
         return True
     collection = get_existing_collection()
     if collection is None:
         return False
+    unique_ids = list(dict.fromkeys(ids))
     try:
-        data = collection.get(ids=ids, include=["metadatas"])
-        found_ids = list(data.get("ids") or [])
-        metadatas = list(data.get("metadatas") or [])
-        if len(found_ids) != len(ids):
+        found_ids, metadatas = _get_metadatas_by_ids(collection, unique_ids)
+        if len(found_ids) != len(unique_ids):
             return False
         updated = []
         for meta in metadatas:
             item = dict(meta or {})
             item["index_complete"] = True
             updated.append(item)
-        collection.update(ids=found_ids, metadatas=updated)
+        if not _update_metadatas_batched(collection, found_ids, updated):
+            _force_ids_incomplete(collection, found_ids)
+            return False
         return True
     except Exception:
-        logger.warning("chroma mark complete failed count=%s", len(ids))
+        logger.warning("chroma mark complete failed count=%s", len(unique_ids))
+        try:
+            _force_ids_incomplete(collection, unique_ids)
+        except Exception:
+            pass
         return False
 
 
@@ -457,14 +536,15 @@ def ensure_legacy_migration() -> dict:
         return {"ok": False, "backup": str(backup) if backup else None}
 
     if unverified_ids:
-        data = collection.get(ids=unverified_ids, include=["metadatas"])
+        found_ids, metadatas = _get_metadatas_by_ids(collection, unverified_ids)
         updated = []
-        for meta in data.get("metadatas") or []:
+        for meta in metadatas:
             item = dict(meta or {})
             item["index_complete"] = False
             item[MIGRATION_FLAG] = MIGRATION_UNVERIFIED
             updated.append(item)
-        collection.update(ids=list(data.get("ids") or []), metadatas=updated)
+        if not _update_metadatas_batched(collection, found_ids, updated):
+            logger.warning("legacy unverified update failed count=%s", len(unverified_ids))
 
     repaired = _repair_partial_complete_documents(collection)
     reset_chroma_client()
@@ -492,16 +572,16 @@ def _repair_partial_complete_documents(collection) -> int:
                 STATUS_INCOMPLETE in statuses or STATUS_UNVERIFIED in statuses
             ):
                 ids = [doc_id for doc_id, _meta, _status in items]
-                data = collection.get(ids=ids, include=["metadatas"])
+                found_ids, metadatas = _get_metadatas_by_ids(collection, ids)
                 updated = []
-                for meta in data.get("metadatas") or []:
+                for meta in metadatas:
                     item = dict(meta or {})
                     item["index_complete"] = False
                     if str(item.get(MIGRATION_FLAG) or "") != MIGRATION_UNVERIFIED:
                         item["index_note"] = "partial_job_downgraded"
                     updated.append(item)
-                collection.update(ids=list(data.get("ids") or []), metadatas=updated)
-                repaired += len(ids)
+                if _update_metadatas_batched(collection, found_ids, updated):
+                    repaired += len(found_ids)
     return repaired
 
 
@@ -572,30 +652,53 @@ def _vectorstore_for_search() -> Chroma | None:
     )
 
 
-def similarity_search(query: str, k: int = RETRIEVE_K) -> list[Document]:
-    """완료된 문서 조각만 검색한다."""
+def usable_job_keys() -> set[tuple[str, str]]:
+    """완전히 저장된 업로드 작업 (content_hash, upload_job_id) 집합."""
     with _store_lock:
         ensure_legacy_migration()
+        analysis = analyze_document_statuses()
+    return set(analysis.get("usable_job_keys") or set())
+
+
+def similarity_search(query: str, k: int = RETRIEVE_K) -> list[Document]:
+    """완료된 업로드 작업의 조각만 검색한다. 같은 해시의 미완료 작업은 제외한다."""
+    with _store_lock:
+        ensure_legacy_migration()
+        analysis = analyze_document_statuses()
     store = _vectorstore_for_search()
     if store is None:
         return []
-    # 여유 있게 가져온 뒤, 문서 단위로 다시 걸러 일부 완료 표시 오용을 막는다.
-    fetch_k = max(k * 3, k)
-    docs = store.similarity_search(query, k=fetch_k, filter=SEARCH_FILTER)
-    usable = existing_content_hashes()
-    filtered = []
-    for doc in docs:
-        meta = doc.metadata or {}
-        if not _truthy_complete(meta.get("index_complete")):
-            continue
-        content_hash = str(meta.get("content_hash") or "")
-        if content_hash and content_hash not in usable:
-            continue
-        if not content_hash:
-            continue
-        filtered.append(doc)
+    jobs = set(analysis.get("usable_job_keys") or set())
+    if not jobs:
+        return []
+
+    # 미완료 조각이 상위 후보를 채울 수 있어 여유 있게 가져온 뒤 작업 단위로 건다.
+    # 부족하면 fetch를 키워 한 번 더 시도한다.
+    filtered: list[Document] = []
+    seen: set[str] = set()
+    fetch_k = max(k * 10, 50)
+    for _attempt in range(2):
+        docs = store.similarity_search(query, k=fetch_k, filter=SEARCH_FILTER)
+        for doc in docs:
+            meta = doc.metadata or {}
+            if not _truthy_complete(meta.get("index_complete")):
+                continue
+            content_hash = str(meta.get("content_hash") or "").strip()
+            if not content_hash:
+                continue
+            job_id = _upload_job_key(meta)
+            if (content_hash, job_id) not in jobs:
+                continue
+            fingerprint = f"{content_hash}:{job_id}:{doc.page_content[:120]}"
+            if fingerprint in seen:
+                continue
+            seen.add(fingerprint)
+            filtered.append(doc)
+            if len(filtered) >= k:
+                return filtered
         if len(filtered) >= k:
             break
+        fetch_k = max(fetch_k * 2, k * 20)
     return filtered
 
 

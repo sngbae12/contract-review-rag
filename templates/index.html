@@ -53,6 +53,7 @@
           <span>RAG 문서</span>
           <strong id="rag-status">대기 중</strong>
         </div>
+        <p id="rag-status-detail" class="status-detail" hidden></p>
         <div class="status-row">
           <span>계약서</span>
           <strong id="contract-status">미업로드</strong>
@@ -91,6 +92,7 @@
   <input id="rag-input" type="file" accept="application/pdf,.pdf" multiple hidden />
   <input id="contract-input" type="file" accept="application/pdf,.pdf" hidden />
 
+  <script src="{{ url_for('static', filename='js/status_utils.js') }}"></script>
   <script src="{{ url_for('static', filename='js/sse_utils.js') }}"></script>
   <script src="{{ url_for('static', filename='js/app.js') }}"></script>
 </body>

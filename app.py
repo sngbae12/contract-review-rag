@@ -50,18 +50,36 @@ MISSING_KEY_MESSAGE = "OpenAI API 키가 없습니다. 왼쪽 입력란에 키�
 
 
 def _extract_api_key() -> str:
-    """요청 헤더·폼·JSON에서만 키를 읽는다. URL 쿼리는 쓰지 않는다."""
+    """요청 헤더·폼·JSON에서만 키를 읽는다. URL 쿼리는 쓰지 않는다. 잘못된 JSON은 무시한다."""
     header = (request.headers.get("X-OpenAI-Api-Key") or "").strip()
     if header:
         return header
     if request.form:
-        form_key = (request.form.get("openai_api_key") or "").strip()
-        if form_key:
-            return form_key
+        form_key = request.form.get("openai_api_key")
+        if isinstance(form_key, str) and form_key.strip():
+            return form_key.strip()
     if request.is_json:
-        data = request.get_json(silent=True) or {}
-        return str(data.get("openai_api_key") or "").strip()
+        data = request.get_json(silent=True)
+        if isinstance(data, dict):
+            raw = data.get("openai_api_key")
+            if isinstance(raw, str):
+                return raw.strip()
     return ""
+
+
+def _parse_json_object() -> tuple[dict | None, tuple[str, int] | None]:
+    """JSON 객체 본문만 허용한다. (객체, None) 또는 (None, (message, status))."""
+    if request.mimetype and "json" not in (request.mimetype or "").lower():
+        if request.data:
+            return None, ("JSON 본문이 필요합니다.", 415)
+    data = request.get_json(silent=True)
+    if data is None:
+        if request.data and request.data.strip():
+            return None, ("요청 JSON을 해석하지 못했습니다.", 400)
+        return {}, None
+    if not isinstance(data, dict):
+        return None, ("요청 본문은 JSON 객체여야 합니다.", 400)
+    return data, None
 
 
 @app.before_request
@@ -292,10 +310,18 @@ def review_contract():
 
 @app.route("/api/chat", methods=["POST"])
 def chat():
+    data, parse_error = _parse_json_object()
+    if parse_error:
+        message, status = parse_error
+        return jsonify({"type": "error", "message": message}), status
     if not current_api_key():
         return _missing_key_response()
-    data = request.get_json(silent=True) or {}
-    question = (data.get("question") or "").strip()
+    question_raw = data.get("question") if data is not None else None
+    if question_raw is None:
+        return jsonify({"type": "error", "message": "질문을 입력해 주세요."}), 400
+    if not isinstance(question_raw, str):
+        return jsonify({"type": "error", "message": "question은 문자열이어야 합니다."}), 400
+    question = question_raw.strip()
     if not question:
         return jsonify({"type": "error", "message": "질문을 입력해 주세요."}), 400
 

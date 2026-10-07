@@ -15,6 +15,7 @@ const chatForm = document.getElementById("chat-form");
 const questionBox = document.getElementById("question");
 const btnSend = document.getElementById("btn-send");
 const ragStatus = document.getElementById("rag-status");
+const ragStatusDetail = document.getElementById("rag-status-detail");
 const contractStatus = document.getElementById("contract-status");
 const composerHint = document.getElementById("composer-hint");
 const apiKeyInput = document.getElementById("openai-api-key");
@@ -89,28 +90,43 @@ function applyUi() {
 }
 
 function stageLabel(kind, stage, ready, extra) {
-  if (stage === "extracting") return "텍스트 추출 중";
-  if (stage === "splitting") return "분할 중";
-  if (stage === "embedding") return "임베딩 중";
-  if (stage === "processing") return "처리 중";
-  if (stage === "error") return ready ? "준비됨 · 마지막 처리 실패" : "처리 실패";
-  if (kind === "rag") {
-    if (ready) return extra ? `준비 완료 (${extra}조각)` : "준비 완료";
-    if (ui.ragIncompleteCount || ui.ragUnverifiedCount) {
-      const parts = [];
-      if (ui.ragUnverifiedCount) parts.push(`미확인 ${ui.ragUnverifiedCount}`);
-      if (ui.ragIncompleteCount) parts.push(`미완료 ${ui.ragIncompleteCount}`);
-      return `${parts.join(" · ")} · 재업로드 필요`;
-    }
-    return "대기 중";
+  const Status = window.ContractReviewStatus;
+  if (kind === "rag" && Status) {
+    return Status.formatRagStatus({
+      stage,
+      ready,
+      usableCount: extra || ui.ragChunkCount || 0,
+      incompleteCount: ui.ragIncompleteCount || 0,
+      unverifiedCount: ui.ragUnverifiedCount || 0,
+    });
   }
-  if (ready) return extra || "준비 완료";
-  return "미업로드";
+  if (Status) {
+    return Status.formatContractStatus({
+      stage,
+      ready,
+      filename: extra || "",
+    });
+  }
+  return ready ? "준비 완료" : "대기 중";
 }
 
 function renderSidebarStatus() {
   ragStatus.textContent = stageLabel("rag", ui.ragStage, ui.ragReady, ui.ragChunkCount);
   ragStatus.title = ui.ragStatusMessage || "";
+  if (ragStatusDetail) {
+    const parts = [];
+    if (ui.ragReady) parts.push(`검토 가능 ${ui.ragChunkCount || 0}조각`);
+    if (ui.ragUnverifiedCount) parts.push(`미확인 ${ui.ragUnverifiedCount}`);
+    if (ui.ragIncompleteCount) parts.push(`미완료 ${ui.ragIncompleteCount}`);
+    if (ui.ragStatusMessage) parts.push(ui.ragStatusMessage);
+    if (parts.length) {
+      ragStatusDetail.hidden = false;
+      ragStatusDetail.textContent = parts.join(" · ");
+    } else {
+      ragStatusDetail.hidden = true;
+      ragStatusDetail.textContent = "";
+    }
+  }
   contractStatus.textContent = stageLabel(
     "contract",
     ui.contractStage,

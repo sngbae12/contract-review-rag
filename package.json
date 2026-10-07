@@ -3,7 +3,7 @@
   "private": true,
   "description": "Frontend unit tests for Contract Review RAG",
   "scripts": {
-    "test": "node --test tests/js/sse_utils.test.mjs"
+    "test": "node --test tests/js/sse_utils.test.mjs tests/js/status_utils.test.mjs"
   },
   "engines": {
     "node": ">=18"

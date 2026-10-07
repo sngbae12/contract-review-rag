@@ -102,7 +102,7 @@ data/chroma_db_backups/ 구버전 메타데이터 마이그레이션 백업
 
 ## 6. 내려받기와 설치
 
-Windows, Python 3.11 기준입니다. 이 저장소를 정리할 때 사용한 버전은 3.11.9입니다.
+GitHub는 소스 배포용이며, 앱은 내려받은 사용자의 컴퓨터에서 실행합니다. Windows, Python 3.11 기준입니다(정리 환경: 3.11.9). GitHub Actions도 Ubuntu·Windows + Python 3.11에서 검증합니다.
 
 ```bat
 git clone https://github.com/sngbae12/contract-review-rag.git
@@ -111,16 +111,18 @@ python -m venv .venv
 .venv\Scripts\python -m pip install -r requirements.txt
 ```
 
-가상환경 없이 전역 Python을 써도 됩니다. `start.bat`은 프로젝트 폴더의 `.venv\Scripts\python.exe`가 있으면 그 Python을 먼저 사용합니다. 필요한 `data/uploads`, `data/chroma_db` 폴더는 앱 시작 시 자동으로 만들어집니다. 경로에 공백·한글이 있어도 프로젝트 루트 기준 상대 경로로 파일을 찾습니다.
+ZIP으로 받은 경우 압축을 푼 폴더에서 위 설치를 진행합니다. 가상환경 없이 전역 Python을 써도 됩니다. `start.bat`은 `cd /d "%~dp0"`로 프로젝트 폴더로 이동한 뒤 `.venv\Scripts\python.exe`가 있으면 그 Python을 먼저 사용합니다. 경로에 공백·한글이 있어도 동작합니다. 필요한 `data/uploads`, `data/chroma_db` 폴더는 앱 시작 시 자동으로 만들어집니다.
 
-자동 테스트:
+허용 파일: PDF만. 업로드 용량 제한: 50MB(`config.MAX_CONTENT_LENGTH`).
+
+자동 테스트(웹앱 실행에는 Node가 필요하지 않습니다. Node.js 18+는 프론트 유틸 테스트용):
 
 ```bat
 .venv\Scripts\python -m unittest discover -s tests -v
 npm test
 ```
 
-Node.js 18 이상이 필요합니다(프론트 SSE 유틸 테스트). Python 테스트는 API 키 없이 실행됩니다.
+Python 테스트는 API 키 없이 실행됩니다.
 
 기존 사용자 업데이트:
 
@@ -129,7 +131,7 @@ git pull origin master
 .venv\Scripts\python -m pip install -r requirements.txt
 ```
 
-서버를 다시 시작하면 구버전 Chroma 메타데이터 마이그레이션이 필요할 때 `data/chroma_db_backups`에 백업을 만든 뒤 처리합니다. 원본 PDF SHA-256으로 검증된 문서만 완료로 표시하고, 검증되지 않은 조각은 검색·중복 방지에서 제외한 채 재업로드를 안내합니다. DB와 업로드 PDF를 임의로 삭제하지 않습니다.
+서버를 다시 시작하면 구버전 Chroma 메타데이터 마이그레이션이 필요할 때 `data/chroma_db_backups`에 백업을 만든 뒤 처리합니다. 구버전 데이터는 원본 PDF 해시가 일치해도 전체 조각 저장 완료를 입증할 수 없으므로 완료로 승격하지 않고 **미확인**으로 유지한 뒤 재인덱싱을 안내합니다. 미확인·미완료 조각은 검색·중복 방지에서 제외합니다. DB와 업로드 PDF를 임의로 삭제하지 않습니다.
 
 ## 7. API 준비와 실행
 
@@ -219,7 +221,7 @@ RAG 인덱싱이 성공으로 확정된 뒤에야 완료(`done`) 이벤트를 �
 
 ## 11. 검증 결과와 미검증 항목
 
-로컬(개발 트리)과 한글·공백이 포함된 새 작업 폴더의 깨끗한 가상환경에서 `pip install -r requirements.txt`, `pip check`, `python -m unittest discover -s tests -v`(51개 통과), `npm test`(7개 통과), Flask `/`·`/api/status` 초기 응답을 확인했습니다. GitHub Actions(`.github/workflows/ci.yml`)는 push/PR 시 Ubuntu·Windows + Python 3.11에서 같은 항목을 실행합니다.
+로컬(개발 트리)과 한글·공백이 포함된 새 작업 폴더의 깨끗한 가상환경에서 `pip install -r requirements.txt`, `pip check`, `python -m unittest discover -s tests -v`, `npm test`(SSE·상태 표시 유틸), Flask `/`·`/api/status` 초기 응답을 확인했습니다. GitHub Actions(`.github/workflows/ci.yml`)는 push/PR 시 Ubuntu·Windows + Python 3.11에서 같은 항목을 실행합니다.
 
 테스트 대역 검증(임시 Chroma + DeterministicFakeEmbedding, 실제 OpenAI 호출 없음):
 
@@ -231,6 +233,10 @@ RAG 인덱싱이 성공으로 확정된 뒤에야 완료(`done`) 이벤트를 �
 - 복구 작업 실패 시 다른 정상 문서 보존
 - 완료·미완료·미확인 섞인 DB의 상태 집계 분리(`rag_unverified_count` / `rag_incomplete_count`)와 검색 제외
 - `/api/status`는 키 없이 로컬 Chroma만 읽으며 임베딩을 호출하지 않음
+- 완료 표시·삭제·마이그레이션 메타데이터 갱신은 Chroma 런타임 배치 한도에 맞춰 분할
+- 같은 해시의 정상 완료 작업과 미완료(true/false 섞인) 작업이 공존할 때 미완료 작업 조각은 검색 제외
+- 상태 문구는 ready/error여도 미확인·미완료 개수를 숨기지 않음(`status_utils` 실행 테스트)
+- `/api/chat` 배열·비문자 question·깨진 JSON은 400/415, OpenAI 미호출
 - 모델 `has_issue=true`인데 수정문구가 동일/비어 있으면 문제 집계 유지·수정문구 미생성 표시
 - `done` 직후 연결 종료·완료 전 취소·배치 일부 실패 롤백·실패 후 재업로드
 - 조항 참조/제목 구분, 긴 조항·페이지 넘김 조항 번호, 검색 실패 시 LLM 미호출
