@@ -1,0 +1,75 @@
+# virtualenv
+.venv/
+.venv-verify/
+venv/
+env/
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+
+# secrets
+.env
+.env.*
+*.pem
+*.key
+
+# uploaded docs, extracted/review artifacts, vector db
+data/uploads/
+data/chroma_db/
+data/sample/contract.pdf
+data/sample/guideline.pdf
+
+# model weights and caches
+*.gguf
+*.bin
+*.safetensors
+*.onnx
+.cache/
+huggingface/
+transformers/
+
+# logs, temp, backup
+*.log
+*.tmp
+*.temp
+*.bak
+*.swp
+*~
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# screenshots and local helper scripts
+*.png
+*.jpg
+*.jpeg
+*.webp
+_probe_*.py
+_verify_*.py
+_write_*.py
+_patch_*.py
+_make_samples.py
+_fix_ignore_and_extract.py
+
+_check_pdf.py
+_check_pdf2.py
+_check_pdf.json
+_extract_out.txt
+_fix_req.py
+_make_korean_pdfs.py
+_pip_check.txt
+_verify_app.py
+_verify_result.json
+_fix_ignore_and_extract.py
+_patch_extract_key.py
+_patch_stream_key.py
+_patch_teardown.py
+_patch_log_readme.py
+_update_ignore.py

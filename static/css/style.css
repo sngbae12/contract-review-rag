@@ -1,0 +1,412 @@
+/* LLM 기반 계약서 검토 - 연한 파랑 / 연한 회색 ChatGPT 스타일 */
+
+:root {
+  --sidebar: #d8ebf8;
+  --sidebar-deep: #c4dff2;
+  --bg: #f3f5f7;
+  --panel: #ffffff;
+  --user-bubble: #e7f2fb;
+  --line: #d5dde5;
+  --text: #243040;
+  --muted: #6b7785;
+  --accent: #3b82b0;
+  --accent-dark: #2a658a;
+  --revised: #003399;
+  --danger: #b42318;
+  --ok: #1f7a4d;
+  --shadow: 0 8px 24px rgba(36, 48, 64, 0.06);
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  height: 100%;
+  color: var(--text);
+  background: var(--bg);
+  font-family: "Segoe UI", "Malgun Gothic", "Apple SD Gothic Neo", sans-serif;
+}
+
+.app {
+  display: flex;
+  height: 100vh;
+}
+
+/* ----- 왼쪽 메뉴 ----- */
+.sidebar {
+  width: 280px;
+  flex-shrink: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
+  padding: 22px 18px;
+  background: linear-gradient(180deg, var(--sidebar) 0%, #eaf3fa 100%);
+  border-right: 1px solid #c9dcea;
+}
+
+.brand {
+  display: flex;
+  gap: 12px;
+  align-items: center;
+}
+
+.brand-mark {
+  width: 44px;
+  height: 44px;
+  border-radius: 12px;
+  display: grid;
+  place-items: center;
+  background: var(--accent);
+  color: #fff;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+}
+
+.brand h1 {
+  margin: 0;
+  font-size: 18px;
+}
+
+.brand p {
+  margin: 4px 0 0;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.menu {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.menu-btn {
+  width: 100%;
+  border: 1px solid #b7d3e8;
+  background: #f7fbfe;
+  color: var(--text);
+  border-radius: 12px;
+  padding: 12px 14px;
+  font-size: 14px;
+  text-align: left;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  transition: background 0.15s ease, transform 0.15s ease;
+}
+
+.menu-btn:hover {
+  background: var(--sidebar-deep);
+}
+
+.menu-btn.primary {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #fff;
+  font-weight: 600;
+}
+
+.menu-btn.primary:hover {
+  background: var(--accent-dark);
+}
+
+.menu-btn:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+.hidden {
+  display: none !important;
+}
+
+.status-card {
+  background: rgba(255, 255, 255, 0.72);
+  border: 1px solid #c9dcea;
+  border-radius: 14px;
+  padding: 14px;
+}
+
+.status-card h2 {
+  margin: 0 0 10px;
+  font-size: 13px;
+  color: var(--muted);
+}
+
+.status-row {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  font-size: 13px;
+  padding: 6px 0;
+}
+
+.status-row strong {
+  font-weight: 600;
+}
+
+.sidebar-hint {
+  margin-top: auto;
+  font-size: 12px;
+  line-height: 1.6;
+  color: var(--muted);
+}
+
+/* ----- 오른쪽 채팅 ----- */
+.main {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  background: var(--bg);
+}
+
+.main-header {
+  height: 60px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0 28px;
+  border-bottom: 1px solid var(--line);
+  background: #f7f9fb;
+}
+
+.main-header h2 {
+  margin: 0;
+  font-size: 16px;
+  font-weight: 600;
+}
+
+.model-badge {
+  font-size: 12px;
+  color: var(--accent-dark);
+  background: #e4f1fa;
+  border: 1px solid #c5dced;
+  border-radius: 999px;
+  padding: 4px 10px;
+}
+
+.chat-log {
+  flex: 1;
+  overflow-y: auto;
+  padding: 28px 0 16px;
+}
+
+.message {
+  width: min(860px, calc(100% - 48px));
+  margin: 0 auto 18px;
+  display: flex;
+  gap: 12px;
+}
+
+.avatar {
+  width: 34px;
+  height: 34px;
+  border-radius: 10px;
+  display: grid;
+  place-items: center;
+  font-size: 12px;
+  font-weight: 700;
+  flex-shrink: 0;
+}
+
+.avatar.bot {
+  background: #d6e8f6;
+  color: var(--accent-dark);
+}
+
+.avatar.user {
+  background: #e8edf2;
+  color: #4b5563;
+}
+
+.bubble {
+  flex: 1;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 16px;
+  padding: 14px 16px;
+  box-shadow: var(--shadow);
+  white-space: pre-wrap;
+  word-break: break-word;
+  line-height: 1.65;
+  font-size: 14.5px;
+}
+
+.message.user .bubble {
+  background: var(--user-bubble);
+}
+
+.bubble .meta {
+  margin-bottom: 8px;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+/* 진행률 바 (tqdm 진행을 화면에 대응) */
+.progress-wrap {
+  margin-top: 8px;
+}
+
+.progress-label {
+  display: flex;
+  justify-content: space-between;
+  font-size: 13px;
+  color: var(--muted);
+  margin-bottom: 6px;
+}
+
+.progress-track {
+  height: 10px;
+  border-radius: 999px;
+  background: #e6edf3;
+  overflow: hidden;
+}
+
+.progress-fill {
+  height: 100%;
+  width: 0%;
+  background: linear-gradient(90deg, #7eb8dc, #3b82b0);
+  transition: width 0.2s ease;
+}
+
+.progress-fill.indeterminate {
+  width: 36%;
+  animation: progress-slide 1.2s ease-in-out infinite;
+}
+
+@keyframes progress-slide {
+  0% { transform: translateX(-20%); }
+  50% { transform: translateX(180%); }
+  100% { transform: translateX(-20%); }
+}
+
+.composer-hint {
+  width: min(860px, calc(100% - 48px));
+  margin: 0 auto 8px;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+/* 계약서 검토 한 문장 */
+.review-item {
+  padding: 10px 0;
+  border-bottom: 1px dashed #e1e7ee;
+}
+
+.review-item:last-child {
+  border-bottom: none;
+}
+
+.tag {
+  font-weight: 700;
+  margin-right: 6px;
+}
+
+.original {
+  color: var(--text);
+}
+
+.revised {
+  margin-top: 4px;
+  color: var(--revised);
+  font-weight: 700;
+}
+
+.reason {
+  margin-top: 4px;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+/* 하단 질문창 */
+.composer {
+  width: min(860px, calc(100% - 48px));
+  margin: 0 auto 22px;
+  display: flex;
+  gap: 10px;
+  align-items: flex-end;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 16px;
+  padding: 10px 10px 10px 14px;
+  box-shadow: var(--shadow);
+}
+
+.composer textarea {
+  flex: 1;
+  border: 0;
+  outline: none;
+  resize: none;
+  max-height: 160px;
+  font: inherit;
+  line-height: 1.5;
+  background: transparent;
+}
+
+.composer button {
+  border: 0;
+  background: var(--accent);
+  color: #fff;
+  border-radius: 10px;
+  padding: 10px 16px;
+  cursor: pointer;
+  font-weight: 600;
+}
+
+.composer button:hover {
+  background: var(--accent-dark);
+}
+
+.composer button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+@media (max-width: 800px) {
+  .app {
+    flex-direction: column;
+  }
+
+  .sidebar {
+    width: 100%;
+    height: auto;
+  }
+
+  .sidebar-hint {
+    display: none;
+  }
+}
+
+.api-key-card {
+  background: rgba(255, 255, 255, 0.72);
+  border: 1px solid #c9dcea;
+  border-radius: 14px;
+  padding: 14px;
+}
+
+.api-key-card label {
+  display: block;
+  font-size: 13px;
+  color: var(--muted);
+  margin-bottom: 8px;
+}
+
+.api-key-card input {
+  width: 100%;
+  border: 1px solid #b7d3e8;
+  background: #f7fbfe;
+  color: var(--text);
+  border-radius: 10px;
+  padding: 9px 10px;
+  font: inherit;
+}
+
+.api-key-card p {
+  margin: 8px 0 0;
+  font-size: 11px;
+  line-height: 1.5;
+  color: var(--muted);
+}

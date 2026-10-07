@@ -1,0 +1,96 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>LLM 기반 계약서 검토</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}" />
+</head>
+<body>
+  <div class="app">
+    <!-- 왼쪽: 메뉴 -->
+    <aside class="sidebar">
+      <div class="brand">
+        <div class="brand-mark">LLM</div>
+        <div>
+          <h1>계약서 검토</h1>
+          <p>가이드라인 RAG + 문장별 수정</p>
+        </div>
+      </div>
+
+      <div class="api-key-card">
+        <label for="openai-api-key">OpenAI API 키</label>
+        <input
+          id="openai-api-key"
+          type="password"
+          autocomplete="off"
+          autocorrect="off"
+          autocapitalize="off"
+          spellcheck="false"
+          placeholder="여기에 키를 입력하세요"
+        />
+        <p>키는 이 입력란의 메모리에만 두고, 파일·브라우저 저장소에는 남기지 않습니다.</p>
+      </div>
+
+      <nav class="menu">
+        <button type="button" id="btn-rag" class="menu-btn">
+          <span class="icon">📄</span>
+          RAG 파일 업로드
+        </button>
+        <button type="button" id="btn-contract" class="menu-btn">
+          <span class="icon">📝</span>
+          계약서 업로드
+        </button>
+        <button type="button" id="btn-review" class="menu-btn primary hidden">
+          <span class="icon">🔍</span>
+          계약서 검토
+        </button>
+      </nav>
+
+      <div class="status-card">
+        <h2>작업 상태</h2>
+        <div class="status-row">
+          <span>RAG 문서</span>
+          <strong id="rag-status">대기 중</strong>
+        </div>
+        <div class="status-row">
+          <span>계약서</span>
+          <strong id="contract-status">미업로드</strong>
+        </div>
+      </div>
+
+      <p class="sidebar-hint">
+        1) 가이드라인/약관 PDF를 올리고<br />
+        2) 계약서 PDF를 올린 뒤<br />
+        3) 계약서 검토를 실행하세요.
+      </p>
+    </aside>
+
+    <!-- 오른쪽: 채팅 / 결과 -->
+    <main class="main">
+      <header class="main-header">
+        <h2>검토 결과</h2>
+        <span class="model-badge">gpt-4o-mini</span>
+      </header>
+
+      <section id="chat-log" class="chat-log" aria-live="polite"></section>
+      <p id="composer-hint" class="composer-hint" hidden></p>
+
+      <form id="chat-form" class="composer">
+        <textarea
+          id="question"
+          rows="1"
+          placeholder="일반적인 질문을 입력하세요. (Enter 전송, Shift+Enter 줄바꿈)"
+        ></textarea>
+        <button type="submit" id="btn-send">전송</button>
+      </form>
+    </main>
+  </div>
+
+  <!-- 실제 버튼은 숨기고, 메뉴 버튼이 이 input을 연다 -->
+  <input id="rag-input" type="file" accept="application/pdf,.pdf" multiple hidden />
+  <input id="contract-input" type="file" accept="application/pdf,.pdf" hidden />
+
+  <script src="{{ url_for('static', filename='js/app.js') }}"></script>
+</body>
+</html>
