@@ -353,7 +353,10 @@ class ChromaStoreTests(unittest.TestCase):
         done = next(e for e in events if e["type"] in ("done", "error"))
         self.assertEqual(done["type"], "done")
         self.assertEqual(done["chunk_count"], 3)
-        self.assertGreaterEqual(self.rag.rag_document_count(), 4)
+        # 신규 완료 후 이전 실패 조각은 정리되어 누적되지 않는다.
+        self.assertEqual(self.rag.rag_document_count(), 3)
+        self.assertEqual(self.rag.usable_rag_count(), 3)
+        self.assertTrue(self.rag.rag_status_summary()["rag_ready"])
 
     def test_done_then_close_keeps_data(self):
         self._seed("keep-1", "기존 유지", "old-hash", complete=True)

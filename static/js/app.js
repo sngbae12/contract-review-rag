@@ -97,7 +97,10 @@ function stageLabel(kind, stage, ready, extra) {
   if (kind === "rag") {
     if (ready) return extra ? `준비 완료 (${extra}조각)` : "준비 완료";
     if (ui.ragIncompleteCount || ui.ragUnverifiedCount) {
-      return "미완료·재업로드 필요";
+      const parts = [];
+      if (ui.ragUnverifiedCount) parts.push(`미확인 ${ui.ragUnverifiedCount}`);
+      if (ui.ragIncompleteCount) parts.push(`미완료 ${ui.ragIncompleteCount}`);
+      return `${parts.join(" · ")} · 재업로드 필요`;
     }
     return "대기 중";
   }
@@ -434,6 +437,17 @@ function appendReviewItem(host, event) {
     skip.className = "reason";
     skip.textContent = event.reason || "짧은 조각이라 검토하지 않았습니다.";
     item.appendChild(skip);
+  } else if (event.has_issue && event.revision_missing) {
+    const miss = document.createElement("div");
+    miss.className = "review-missing";
+    const tag = document.createElement("span");
+    tag.className = "tag";
+    tag.textContent = "[수정문구 미생성]";
+    miss.append(
+      tag,
+      document.createTextNode(event.reason || "문제가 있으나 수정문구가 없어 추가 검토가 필요합니다.")
+    );
+    item.appendChild(miss);
   } else if (event.has_issue && event.revised) {
     const revised = document.createElement("div");
     revised.className = "revised";
@@ -448,6 +462,17 @@ function appendReviewItem(host, event) {
       reason.textContent = `사유: ${event.reason}`;
       item.appendChild(reason);
     }
+  } else if (event.has_issue) {
+    const miss = document.createElement("div");
+    miss.className = "review-missing";
+    const tag = document.createElement("span");
+    tag.className = "tag";
+    tag.textContent = "[추가 검토 필요]";
+    miss.append(
+      tag,
+      document.createTextNode(event.reason || "문제가 있으나 수정문구가 생성되지 않았습니다.")
+    );
+    item.appendChild(miss);
   }
 
   host.appendChild(item);

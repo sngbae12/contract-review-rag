@@ -41,6 +41,7 @@ class ReviewState(TypedDict):
     has_issue: bool
     revised_text: str
     reason: str
+    revision_missing: bool
 
 
 def _llm() -> ChatOpenAI:
@@ -139,6 +140,7 @@ def _retrieve_node(state: ReviewState) -> dict:
             "has_issue": False,
             "revised_text": query,
             "reason": "가이드라인 검색에 실패했습니다. API 키와 네트워크를 확인한 뒤 다시 검토해 주세요.",
+            "revision_missing": False,
         }
 
     if not docs:
@@ -149,6 +151,7 @@ def _retrieve_node(state: ReviewState) -> dict:
             "has_issue": False,
             "revised_text": query,
             "reason": "관련 가이드라인 조각을 찾지 못해 근거가 부족합니다. 업로드한 문서를 근거로 판단하지 않았습니다.",
+            "revision_missing": False,
         }
 
     lines = []
@@ -194,13 +197,27 @@ def run_analysis(text: str, context: str) -> dict:
 - 검색된 내용에 없는 가이드라인을 있는 것처럼 인용하지 않는다
 """
     decision = structured_llm.invoke(prompt)
-    revised = decision.revised_sentence.strip() or text
-    has_issue = bool(decision.has_issue) and revised != text
+    has_issue = bool(decision.has_issue)
+    revised_raw = (decision.revised_sentence or "").strip()
+    reason = (decision.reason or "").strip()
+    revision_missing = False
+    if has_issue:
+        if revised_raw and revised_raw != text:
+            revised = revised_raw
+        else:
+            # 문제 판단은 유지하고, 수정문구만 없음을 표시한다.
+            revised = text
+            revision_missing = True
+            note = "수정문구 미생성 — 추가 검토 필요"
+            reason = f"{reason} ({note})" if reason else note
+    else:
+        revised = revised_raw or text
     return {
         "item_status": "reviewed",
         "has_issue": has_issue,
         "revised_text": revised,
-        "reason": decision.reason,
+        "reason": reason,
+        "revision_missing": revision_missing,
     }
 
 
@@ -258,6 +275,7 @@ def review_sentences(units: list) -> Generator[dict, None, None]:
     }
 
     issue_count = 0
+    revision_missing_count = 0
     reviewed_count = 0
     search_error_count = 0
     no_evidence_count = 0
@@ -278,6 +296,7 @@ def review_sentences(units: list) -> Generator[dict, None, None]:
                         "has_issue": False,
                         "revised_text": text,
                         "reason": "검토 대상이 아닌 짧은 조각입니다.",
+                        "revision_missing": False,
                     }
                     skipped_count += 1
                 else:
@@ -290,6 +309,7 @@ def review_sentences(units: list) -> Generator[dict, None, None]:
                             "has_issue": False,
                             "revised_text": text,
                             "reason": "",
+                            "revision_missing": False,
                         }
                     )
                     item_status = result.get("item_status") or "reviewed"
@@ -301,6 +321,8 @@ def review_sentences(units: list) -> Generator[dict, None, None]:
                         reviewed_count += 1
                         if result.get("has_issue"):
                             issue_count += 1
+                            if result.get("revision_missing"):
+                                revision_missing_count += 1
 
                 pbar.update(1)
                 percent = int(index / total * 100)
@@ -313,6 +335,7 @@ def review_sentences(units: list) -> Generator[dict, None, None]:
                     "original": text,
                     "revised": result.get("revised_text") or text,
                     "has_issue": bool(result.get("has_issue")) and item_status == "reviewed",
+                    "revision_missing": bool(result.get("revision_missing")) and item_status == "reviewed",
                     "reason": result.get("reason") or "",
                     "item_status": item_status,
                     "source_file": source_file,
@@ -334,13 +357,15 @@ def review_sentences(units: list) -> Generator[dict, None, None]:
             f"계약서 검토가 끝났습니다.\n"
             f"- 전체 단위: {total}개\n"
             f"- 검토 성공: {reviewed_count}개\n"
-            f"- 수정이 필요한 항목: {issue_count}개\n"
+            f"- 문제가 있는 항목: {issue_count}개\n"
+            f"- 수정문구 미생성: {revision_missing_count}개\n"
             f"- 근거 부족: {no_evidence_count}개\n"
             f"- 검토 실패(검색 오류): {search_error_count}개\n"
             f"- 짧은 조각 생략: {skipped_count}개"
         ),
         "total": total,
         "issue_count": issue_count,
+        "revision_missing_count": revision_missing_count,
         "reviewed_count": reviewed_count,
         "no_evidence_count": no_evidence_count,
         "search_error_count": search_error_count,

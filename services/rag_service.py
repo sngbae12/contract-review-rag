@@ -3,7 +3,7 @@
 RAG 서비스
 - 가이드라인/약관 PDF를 분할·임베딩 후 Chroma에 저장한다.
 - 검토용 검색·준비 상태는 문서 전체가 완료된 조각만 사용한다.
-- 구버전 메타데이터는 백업 후 검증 가능한 범위에서만 마이그레이션한다.
+- 구버전 메타데이터는 백업 후 미확인으로 표시하고, PDF 해시만으로 완료 승격하지 않는다.
 """
 
 from __future__ import annotations
@@ -45,7 +45,12 @@ _local_client: chromadb.ClientAPI | None = None
 _migration_done_for: str | None = None
 
 MIGRATION_FLAG = "migration_v1"
+MIGRATION_UNVERIFIED = "unverified_needs_reindex"
 SEARCH_FILTER = {"index_complete": True}
+STATUS_COMPLETE = "complete"
+STATUS_INCOMPLETE = "incomplete"
+STATUS_UNVERIFIED = "unverified"
+_NO_JOB = "__nojob__"
 
 
 def reset_chroma_client() -> None:
@@ -108,23 +113,61 @@ def _has_complete_field(meta: dict | None) -> bool:
     return "index_complete" in meta
 
 
+def _chunk_index_status(meta: dict | None) -> str:
+    """조각 단위 상태: 완료 / 미완료(인덱싱 실패) / 미확인(구버전)."""
+    meta = meta or {}
+    flag = str(meta.get(MIGRATION_FLAG) or "").strip()
+    if flag == MIGRATION_UNVERIFIED:
+        return STATUS_UNVERIFIED
+    if not _has_complete_field(meta):
+        return STATUS_UNVERIFIED
+    if _truthy_complete(meta.get("index_complete")):
+        return STATUS_COMPLETE
+    return STATUS_INCOMPLETE
+
+
+def _content_hash_key(meta: dict, doc_id: str) -> str:
+    content_hash = str(meta.get("content_hash") or "").strip()
+    return content_hash or f"__id__:{doc_id}"
+
+
+def _upload_job_key(meta: dict) -> str:
+    job = str(meta.get("upload_job_id") or "").strip()
+    return job or _NO_JOB
+
+
 def _group_chunks_by_hash(collection) -> dict[str, list[tuple[str, dict]]]:
     data = collection.get(include=["metadatas"])
     groups: dict[str, list[tuple[str, dict]]] = defaultdict(list)
     for doc_id, meta in zip(data.get("ids") or [], data.get("metadatas") or []):
         meta = dict(meta or {})
-        content_hash = str(meta.get("content_hash") or "").strip()
-        key = content_hash or f"__id__:{doc_id}"
-        groups[key].append((doc_id, meta))
+        groups[_content_hash_key(meta, doc_id)].append((doc_id, meta))
+    return groups
+
+
+def _group_chunks_by_hash_and_job(
+    collection,
+) -> dict[str, dict[str, list[tuple[str, dict, str]]]]:
+    """content_hash → upload_job_id → [(id, meta, status)]."""
+    data = collection.get(include=["metadatas"])
+    groups: dict[str, dict[str, list[tuple[str, dict, str]]]] = defaultdict(
+        lambda: defaultdict(list)
+    )
+    for doc_id, meta in zip(data.get("ids") or [], data.get("metadatas") or []):
+        meta = dict(meta or {})
+        content_hash = _content_hash_key(meta, doc_id)
+        job_id = _upload_job_key(meta)
+        status = _chunk_index_status(meta)
+        groups[content_hash][job_id].append((doc_id, meta, status))
     return groups
 
 
 def analyze_document_statuses(collection=None) -> dict:
     """
-    문서(content_hash) 단위로 완료·미완료·미확인을 판단한다.
-    - 모든 조각이 index_complete=True 인 문서만 usable
-    - 하나라도 False면 incomplete (일부 True만으로 완료 처리하지 않음)
-    - 필드가 전부 없으면 legacy_unverified (검증/마이그레이션 대상)
+    저장 작업(upload_job_id) 단위로 완료를 판단한 뒤 content_hash로 묶는다.
+    - 한 작업의 모든 조각이 완료면 그 작업은 usable
+    - 이전 실패 조각이 같은 content_hash여도 신규 완료 작업을 무효화하지 않음
+    - 미확인(구버전)과 미완료(인덱싱 실패)는 별도 집계
     """
     collection = collection or get_existing_collection()
     result = {
@@ -143,34 +186,43 @@ def analyze_document_statuses(collection=None) -> dict:
         return result
 
     try:
-        groups = _group_chunks_by_hash(collection)
+        by_hash = _group_chunks_by_hash_and_job(collection)
     except Exception:
         logger.warning("chroma analyze failed")
         return result
 
-    for content_hash, items in groups.items():
-        result["total_count"] += len(items)
-        flags = []
-        for _doc_id, meta in items:
-            if not _has_complete_field(meta):
-                flags.append(None)
-            else:
-                flags.append(_truthy_complete(meta.get("index_complete")))
+    for content_hash, jobs in by_hash.items():
+        complete_ids: list[str] = []
+        incomplete_ids: list[str] = []
+        unverified_ids: list[str] = []
 
-        ids = [doc_id for doc_id, _ in items]
-        if all(flag is True for flag in flags):
+        for _job_id, items in jobs.items():
+            result["total_count"] += len(items)
+            statuses = [status for _doc_id, _meta, status in items]
+            ids = [doc_id for doc_id, _meta, _status in items]
+            if statuses and all(status == STATUS_COMPLETE for status in statuses):
+                complete_ids.extend(ids)
+            elif statuses and all(status == STATUS_UNVERIFIED for status in statuses):
+                unverified_ids.extend(ids)
+            else:
+                for doc_id, _meta, status in items:
+                    if status == STATUS_UNVERIFIED:
+                        unverified_ids.append(doc_id)
+                    else:
+                        incomplete_ids.append(doc_id)
+
+        if complete_ids:
             result["usable_hashes"].add(content_hash)
-            result["usable_chunk_ids"].extend(ids)
-            result["usable_count"] += len(items)
-        elif any(flag is False for flag in flags):
-            # 일부만 True여도 문서 전체는 미완료
+            result["usable_chunk_ids"].extend(complete_ids)
+            result["usable_count"] += len(complete_ids)
+        if incomplete_ids:
             result["incomplete_hashes"].add(content_hash)
-            result["incomplete_chunk_ids"].extend(ids)
-            result["incomplete_count"] += len(items)
-        else:
+            result["incomplete_chunk_ids"].extend(incomplete_ids)
+            result["incomplete_count"] += len(incomplete_ids)
+        if unverified_ids:
             result["unverified_hashes"].add(content_hash)
-            result["unverified_chunk_ids"].extend(ids)
-            result["unverified_count"] += len(items)
+            result["unverified_chunk_ids"].extend(unverified_ids)
+            result["unverified_count"] += len(unverified_ids)
     return result
 
 
@@ -342,8 +394,9 @@ def _discover_pdf_hashes(roots: list[Path]) -> dict[str, Path]:
 def ensure_legacy_migration() -> dict:
     """
     구버전(index_complete 없음) 데이터를 백업 후 처리한다.
-    - 원본 PDF SHA-256으로 검증되면 완료로 표시
-    - 검증 불가면 미확인으로 두고 검색·중복 방지에서 제외
+    - 원본 PDF 해시 일치만으로는 전체 조각 저장 완료를 입증할 수 없으므로 완료로 승격하지 않는다.
+    - 미확인으로 표시하고 검색·중복 방지에서 제외한 뒤 재인덱싱을 안내한다.
+    - OpenAI 임베딩을 호출하지 않는다.
     - 반복 실행해도 중복 생성·손상 없음
     """
     global _migration_done_for
@@ -356,11 +409,18 @@ def ensure_legacy_migration() -> dict:
         _migration_done_for = marker
         return {"skipped": True, "reason": "no_collection"}
 
-    analysis = analyze_document_statuses(collection)
-    if not analysis["unverified_chunk_ids"] and not any(
-        str(h).startswith("__id__:") for h in analysis["unverified_hashes"]
-    ):
-        # 미확인이 없어도, 문서 일부만 True인 비정상 상태는 정리
+    legacy_ids: list[str] = []
+    try:
+        data = collection.get(include=["metadatas"])
+        for doc_id, meta in zip(data.get("ids") or [], data.get("metadatas") or []):
+            meta = dict(meta or {})
+            if not _has_complete_field(meta) and str(meta.get(MIGRATION_FLAG) or "") != MIGRATION_UNVERIFIED:
+                legacy_ids.append(doc_id)
+    except Exception:
+        logger.warning("chroma legacy scan failed")
+        legacy_ids = []
+
+    if not legacy_ids:
         repaired = _repair_partial_complete_documents(collection)
         _migration_done_for = marker
         return {"skipped": True, "reason": "nothing_unverified", "repaired": repaired}
@@ -371,50 +431,38 @@ def ensure_legacy_migration() -> dict:
     if collection is None:
         return {"ok": False, "backup": str(backup) if backup else None}
 
+    # PDF 존재 여부는 안내 참고용. 완료 승격에는 쓰지 않는다.
     pdf_hashes = _discover_pdf_hashes([RAG_UPLOAD_DIR, SAMPLE_DIR])
-    analysis = analyze_document_statuses(collection)
-    verified_ids: list[str] = []
     unverified_ids: list[str] = []
-    verified_hashes: list[str] = []
     unverified_hashes: list[str] = []
+    pdf_present_hashes: list[str] = []
 
-    groups = _group_chunks_by_hash(collection)
-    for content_hash, items in groups.items():
-        flags = []
-        for _doc_id, meta in items:
-            if not _has_complete_field(meta):
-                flags.append(None)
-            else:
-                flags.append(_truthy_complete(meta.get("index_complete")))
-        if any(flag is False for flag in flags) or all(flag is True for flag in flags):
-            continue
-        # legacy: all missing index_complete
-        ids = [doc_id for doc_id, _ in items]
-        if content_hash in pdf_hashes and not str(content_hash).startswith("__id__:"):
-            verified_ids.extend(ids)
-            verified_hashes.append(content_hash)
-        else:
-            unverified_ids.extend(ids)
-            unverified_hashes.append(content_hash)
-
-    if verified_ids:
-        data = collection.get(ids=verified_ids, include=["metadatas"])
-        updated = []
-        for meta in data.get("metadatas") or []:
-            item = dict(meta or {})
-            item["index_complete"] = True
-            item[MIGRATION_FLAG] = "verified_from_pdf"
-            updated.append(item)
-        collection.update(ids=list(data.get("ids") or []), metadatas=updated)
+    try:
+        data = collection.get(include=["metadatas"])
+        for doc_id, meta in zip(data.get("ids") or [], data.get("metadatas") or []):
+            meta = dict(meta or {})
+            if _has_complete_field(meta):
+                continue
+            if str(meta.get(MIGRATION_FLAG) or "") == MIGRATION_UNVERIFIED:
+                continue
+            unverified_ids.append(doc_id)
+            content_hash = _content_hash_key(meta, doc_id)
+            if content_hash not in unverified_hashes:
+                unverified_hashes.append(content_hash)
+            if content_hash in pdf_hashes and not str(content_hash).startswith("__id__:"):
+                if content_hash not in pdf_present_hashes:
+                    pdf_present_hashes.append(content_hash)
+    except Exception:
+        logger.warning("chroma legacy classify failed")
+        return {"ok": False, "backup": str(backup) if backup else None}
 
     if unverified_ids:
         data = collection.get(ids=unverified_ids, include=["metadatas"])
         updated = []
         for meta in data.get("metadatas") or []:
             item = dict(meta or {})
-            # 검색·중복에 쓰지 않도록 False. 원본을 지우지 않고 재업로드 유도.
             item["index_complete"] = False
-            item[MIGRATION_FLAG] = "unverified_needs_reindex"
+            item[MIGRATION_FLAG] = MIGRATION_UNVERIFIED
             updated.append(item)
         collection.update(ids=list(data.get("ids") or []), metadatas=updated)
 
@@ -424,37 +472,79 @@ def ensure_legacy_migration() -> dict:
     return {
         "ok": True,
         "backup": str(backup) if backup else None,
-        "verified_hashes": verified_hashes,
+        "verified_hashes": [],
+        "pdf_present_but_unverified_hashes": pdf_present_hashes,
         "unverified_hashes": unverified_hashes,
-        "verified_chunks": len(verified_ids),
+        "verified_chunks": 0,
         "unverified_chunks": len(unverified_ids),
         "repaired": repaired,
     }
 
 
 def _repair_partial_complete_documents(collection) -> int:
-    """같은 content_hash에 True/False가 섞이면 문서 전체를 미완료로 맞춘다."""
+    """같은 upload_job_id 안에서 상태가 섞이면 그 작업만 미완료로 맞춘다."""
     repaired = 0
-    groups = _group_chunks_by_hash(collection)
-    for _content_hash, items in groups.items():
-        flags = []
-        for _doc_id, meta in items:
-            if not _has_complete_field(meta):
-                flags.append(None)
-            else:
-                flags.append(_truthy_complete(meta.get("index_complete")))
-        if True in flags and False in flags:
-            ids = [doc_id for doc_id, _ in items]
-            data = collection.get(ids=ids, include=["metadatas"])
-            updated = []
-            for meta in data.get("metadatas") or []:
-                item = dict(meta or {})
-                item["index_complete"] = False
-                item["index_note"] = "partial_complete_downgraded"
-                updated.append(item)
-            collection.update(ids=list(data.get("ids") or []), metadatas=updated)
-            repaired += len(ids)
+    by_hash = _group_chunks_by_hash_and_job(collection)
+    for _content_hash, jobs in by_hash.items():
+        for _job_id, items in jobs.items():
+            statuses = [status for _doc_id, _meta, status in items]
+            if STATUS_COMPLETE in statuses and (
+                STATUS_INCOMPLETE in statuses or STATUS_UNVERIFIED in statuses
+            ):
+                ids = [doc_id for doc_id, _meta, _status in items]
+                data = collection.get(ids=ids, include=["metadatas"])
+                updated = []
+                for meta in data.get("metadatas") or []:
+                    item = dict(meta or {})
+                    item["index_complete"] = False
+                    if str(item.get(MIGRATION_FLAG) or "") != MIGRATION_UNVERIFIED:
+                        item["index_note"] = "partial_job_downgraded"
+                    updated.append(item)
+                collection.update(ids=list(data.get("ids") or []), metadatas=updated)
+                repaired += len(ids)
     return repaired
+
+
+def purge_superseded_chunks(keep_ids: list[str]) -> dict:
+    """신규 완료 조각과 같은 content_hash의 이전 실패·구버전 조각을 삭제한다."""
+    result = {"deleted": 0, "ok": True, "remaining_stale": 0}
+    unique_keep = list(dict.fromkeys(keep_ids or []))
+    if not unique_keep:
+        return result
+    collection = get_existing_collection()
+    if collection is None:
+        return result
+    try:
+        kept = collection.get(ids=unique_keep, include=["metadatas"])
+        keep_set = set(kept.get("ids") or [])
+        target_hashes: set[str] = set()
+        for _doc_id, meta in zip(kept.get("ids") or [], kept.get("metadatas") or []):
+            meta = dict(meta or {})
+            content_hash = str(meta.get("content_hash") or "").strip()
+            if content_hash:
+                target_hashes.add(content_hash)
+        if not target_hashes:
+            return result
+        all_data = collection.get(include=["metadatas"])
+        stale_ids: list[str] = []
+        for doc_id, meta in zip(all_data.get("ids") or [], all_data.get("metadatas") or []):
+            if doc_id in keep_set:
+                continue
+            meta = dict(meta or {})
+            content_hash = str(meta.get("content_hash") or "").strip()
+            if content_hash in target_hashes:
+                stale_ids.append(doc_id)
+        if not stale_ids:
+            return result
+        deleted = delete_ids(stale_ids)
+        result["deleted"] = int(deleted.get("deleted") or 0)
+        result["remaining_stale"] = int(deleted.get("remaining") or 0)
+        result["ok"] = bool(deleted.get("ok"))
+        return result
+    except Exception:
+        logger.warning("purge superseded chunks failed")
+        result["ok"] = False
+        return result
 
 
 def _vectorstore_for_write() -> Chroma:
@@ -743,6 +833,8 @@ def index_pdfs(
             }
             return
 
+        # 같은 content_hash의 이전 실패·미확인 조각을 정리해 재업로드 누적을 막는다.
+        purge_superseded_chunks(added_ids)
         reset_chroma_client()
         summary = rag_status_summary()
         collection_count = summary["usable_count"]

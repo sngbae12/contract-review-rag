@@ -220,7 +220,7 @@ class RagIntegrityTests(unittest.TestCase):
         self.assertEqual(done["chunk_count"], 2)
         self.assertEqual(self.rag.usable_rag_count(), 2)
 
-    def test_legacy_verified_by_pdf_hash(self):
+    def test_legacy_with_pdf_stays_unverified(self):
         sample = SAMPLE_DIR / "virtual_guideline.pdf"
         digest = self.rag.file_sha256(sample)
         shutil.copy2(sample, self.uploads / "kept.pdf")
@@ -228,7 +228,7 @@ class RagIntegrityTests(unittest.TestCase):
             [
                 {
                     "id": "legacy-1",
-                    "text": "구버전 정상 저장 조각",
+                    "text": "구버전 일부 저장 조각",
                     "meta": {
                         "source_file": "kept.pdf",
                         "content_hash": digest,
@@ -240,12 +240,16 @@ class RagIntegrityTests(unittest.TestCase):
         result = self.rag.ensure_legacy_migration()
         self.assertTrue(result.get("ok"))
         self.assertTrue(result.get("backup"))
-        self.assertEqual(self.rag.usable_rag_count(), 1)
-        self.assertIn(digest, self.rag.existing_content_hashes())
+        # PDF 해시만으로는 완료 승격하지 않음
+        self.assertEqual(self.rag.usable_rag_count(), 0)
+        self.assertNotIn(digest, self.rag.existing_content_hashes())
+        summary = self.rag.rag_status_summary()
+        self.assertEqual(summary["unverified_count"], 1)
+        self.assertEqual(summary["incomplete_count"], 0)
         # 반복 실행
         again = self.rag.ensure_legacy_migration()
         self.assertTrue(again.get("skipped") or again.get("ok") is not False)
-        self.assertEqual(self.rag.usable_rag_count(), 1)
+        self.assertEqual(self.rag.usable_rag_count(), 0)
         self.assertEqual(self.rag.rag_document_count(), 1)
 
     def test_legacy_unverified_excluded_and_allows_reindex(self):
