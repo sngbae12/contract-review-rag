@@ -24,15 +24,16 @@ SAMPLE_DIR = BASE_DIR / "data" / "sample"
 LLM_MODEL = "gpt-4o-mini"
 EMBEDDING_MODEL = "text-embedding-3-small"
 
-# RAG 문서 분할: 30글자, 5글자 오버랩
-RAG_CHUNK_SIZE = 30
-RAG_CHUNK_OVERLAP = 5
-RAG_SEPARATORS = ["\n", "\n\n"]
+# RAG 문서 분할: 검색용. 문단·줄·문장 경계를 우선하고, 마지막에 글자 단위로 자른다.
+# 이전 30글자 설정은 조항 의미가 끊기고, 구분자가 없으면 긴 줄이 그대로 남았다.
+RAG_CHUNK_SIZE = 400
+RAG_CHUNK_OVERLAP = 50
+RAG_SEPARATORS = ["\n\n", "\n", ". ", ".", " ", ""]
 
-# 계약서 분할: 30글자, 오버랩 없음
-CONTRACT_CHUNK_SIZE = 30
+# 계약서 분할: 제N조·문단을 검토 단위로 유지하고, 긴 조항만 추가 분할한다.
+CONTRACT_CHUNK_SIZE = 800
 CONTRACT_CHUNK_OVERLAP = 0
-CONTRACT_SEPARATORS = ["\n", "\n\n"]
+CONTRACT_SEPARATORS = ["\n\n", "\n", ". ", ".", " ", ""]
 
 # 유사 문서 검색 개수
 RETRIEVE_K = 5

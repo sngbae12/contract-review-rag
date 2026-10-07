@@ -290,10 +290,33 @@ body {
   color: var(--muted);
 }
 
-/* 계약서 검토 한 문장 */
+/* 계약서 검토 항목 */
 .review-item {
   padding: 10px 0;
   border-bottom: 1px dashed #e1e7ee;
+}
+
+.review-location {
+  font-size: 12px;
+  color: var(--muted);
+  margin-bottom: 4px;
+}
+
+.review-fail {
+  margin-top: 4px;
+  color: var(--danger);
+  font-weight: 600;
+}
+
+.review-missing {
+  margin-top: 4px;
+  color: #8a5a12;
+  font-weight: 600;
+}
+
+.stream-note {
+  margin-top: 10px;
+  color: var(--danger);
 }
 
 .review-item:last-child {

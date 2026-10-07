@@ -42,7 +42,7 @@ APP_STATE: dict = {
     "contract_ready": False,
     "contract_stage": "idle",
     "contract_filename": "",
-    "contract_sentences": [],
+    "contract_units": [],
     "reviewing": False,
 }
 
@@ -84,6 +84,22 @@ def _sse(payload: dict) -> str:
     return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
 
 
+def _sync_rag_state(processing: bool = False) -> int:
+    """화면 표시는 로컬 DB 개수를 따른다. 처리 중이 아니면 준비 여부도 DB와 맞춘다."""
+    chunk_count = rag_document_count()
+    APP_STATE["rag_chunk_count"] = chunk_count
+    if processing:
+        APP_STATE["rag_ready"] = chunk_count > 0
+        return chunk_count
+    APP_STATE["rag_ready"] = chunk_count > 0
+    if chunk_count > 0:
+        if APP_STATE.get("rag_stage") in ("idle", None, "error"):
+            APP_STATE["rag_stage"] = "ready"
+    elif APP_STATE.get("rag_stage") not in ("extracting", "splitting", "embedding"):
+        APP_STATE["rag_stage"] = "idle"
+    return chunk_count
+
+
 def _stream_events(events, kind: str | None = None):
     try:
         for event in events:
@@ -93,19 +109,22 @@ def _stream_events(events, kind: str | None = None):
                 if etype == "progress":
                     APP_STATE["rag_stage"] = stage or "processing"
                 elif etype == "done":
-                    count = int(event.get("collection_count") or 0)
-                    APP_STATE["rag_ready"] = count > 0
-                    APP_STATE["rag_chunk_count"] = count
-                    APP_STATE["rag_stage"] = "ready"
+                    count = _sync_rag_state()
+                    if event.get("collection_count") is not None:
+                        count = int(event.get("collection_count") or 0)
+                        APP_STATE["rag_chunk_count"] = count
+                        APP_STATE["rag_ready"] = count > 0
+                    APP_STATE["rag_stage"] = "ready" if count > 0 else "idle"
                 elif etype == "error":
-                    APP_STATE["rag_stage"] = "error"
+                    _sync_rag_state()
+                    APP_STATE["rag_stage"] = "error" if not APP_STATE["rag_ready"] else "error"
             elif kind == "contract":
                 if etype == "progress":
                     APP_STATE["contract_stage"] = stage or "processing"
-                elif etype == "done" and "sentences" in event:
+                elif etype == "done" and "units" in event:
                     APP_STATE["contract_ready"] = True
                     APP_STATE["contract_filename"] = event.get("filename", "")
-                    APP_STATE["contract_sentences"] = event.get("sentences", [])
+                    APP_STATE["contract_units"] = event.get("units", [])
                     APP_STATE["contract_stage"] = "ready"
                 elif etype == "error":
                     APP_STATE["contract_stage"] = "error"
@@ -114,6 +133,7 @@ def _stream_events(events, kind: str | None = None):
             yield _sse(event)
     except MissingApiKeyError:
         if kind == "rag":
+            _sync_rag_state()
             APP_STATE["rag_stage"] = "error"
         elif kind == "contract":
             APP_STATE["contract_stage"] = "error"
@@ -123,6 +143,7 @@ def _stream_events(events, kind: str | None = None):
     except Exception as exc:
         app.logger.error("stream failed kind=%s", kind)
         if kind == "rag":
+            _sync_rag_state()
             APP_STATE["rag_stage"] = "error"
         elif kind == "contract":
             APP_STATE["contract_stage"] = "error"
@@ -138,8 +159,10 @@ def _stream_events(events, kind: str | None = None):
     finally:
         if kind == "review":
             APP_STATE["reviewing"] = False
-        if kind == "rag" and APP_STATE.get("rag_stage") not in ("ready", "error"):
-            APP_STATE["rag_stage"] = "idle"
+        if kind == "rag" and APP_STATE.get("rag_stage") not in ("ready", "error", "idle"):
+            _sync_rag_state()
+            if APP_STATE.get("rag_stage") not in ("ready", "error"):
+                APP_STATE["rag_stage"] = "idle"
         if kind == "contract" and APP_STATE.get("contract_stage") not in ("ready", "error"):
             APP_STATE["contract_stage"] = "idle"
 
@@ -170,8 +193,8 @@ def _sse_with_key(key: str, events, kind: str | None = None):
     return _sse_response(generate())
 
 
-def _save_pdfs(file_storages, dest_dir: Path) -> list[Path]:
-    saved: list[Path] = []
+def _save_pdfs(file_storages, dest_dir: Path) -> list[tuple[Path, str]]:
+    saved: list[tuple[Path, str]] = []
     dest_dir.mkdir(parents=True, exist_ok=True)
     for storage in file_storages:
         if not storage or not storage.filename:
@@ -179,11 +202,12 @@ def _save_pdfs(file_storages, dest_dir: Path) -> list[Path]:
         filename = storage.filename
         if not filename.lower().endswith(".pdf"):
             continue
-        safe_name = secure_filename(filename) or "upload.pdf"
+        original_name = Path(filename).name
+        safe_name = secure_filename(original_name) or "upload.pdf"
         unique_name = f"{uuid.uuid4().hex[:8]}_{safe_name}"
         path = dest_dir / unique_name
         storage.save(str(path))
-        saved.append(path)
+        saved.append((path, original_name))
     return saved
 
 
@@ -194,19 +218,15 @@ def index():
 
 @app.route("/api/status")
 def status():
-    chunk_count = APP_STATE.get("rag_chunk_count") or rag_document_count()
-    APP_STATE["rag_chunk_count"] = chunk_count
-    APP_STATE["rag_ready"] = chunk_count > 0 or bool(APP_STATE.get("rag_ready"))
-    if chunk_count > 0 and APP_STATE.get("rag_stage") in ("idle", None):
-        APP_STATE["rag_stage"] = "ready"
+    chunk_count = _sync_rag_state(processing=APP_STATE.get("rag_stage") in ("extracting", "splitting", "embedding"))
     return jsonify(
         {
-            "rag_ready": bool(APP_STATE["rag_ready"]) and chunk_count > 0,
+            "rag_ready": bool(chunk_count > 0),
             "rag_chunk_count": chunk_count,
-            "rag_stage": APP_STATE.get("rag_stage") or "idle",
+            "rag_stage": APP_STATE.get("rag_stage") or ("ready" if chunk_count > 0 else "idle"),
             "contract_ready": bool(APP_STATE["contract_ready"]),
             "contract_filename": APP_STATE["contract_filename"],
-            "contract_sentence_count": len(APP_STATE["contract_sentences"]),
+            "contract_unit_count": len(APP_STATE.get("contract_units") or []),
             "contract_stage": APP_STATE.get("contract_stage") or "idle",
             "reviewing": bool(APP_STATE.get("reviewing")),
         }
@@ -225,7 +245,9 @@ def upload_rag():
     app.logger.info("rag upload accepted files=%s", len(saved))
     APP_STATE["rag_stage"] = "extracting"
     key = current_api_key()
-    return _sse_with_key(key, index_pdfs(saved), kind="rag")
+    paths = [item[0] for item in saved]
+    originals = [item[1] for item in saved]
+    return _sse_with_key(key, index_pdfs(paths, originals), kind="rag")
 
 
 @app.route("/api/upload_contract", methods=["POST"])
@@ -237,17 +259,22 @@ def upload_contract():
 
     app.logger.info("contract upload accepted")
     APP_STATE["contract_stage"] = "extracting"
-    return _sse_with_key(current_api_key(), split_contract_pdf(saved[0]), kind="contract")
+    path, original_name = saved[0]
+    return _sse_with_key(
+        current_api_key(),
+        split_contract_pdf(path, original_filename=original_name),
+        kind="contract",
+    )
 
 
 @app.route("/api/review", methods=["POST"])
 def review_contract():
     if not current_api_key():
         return _missing_key_response()
-    sentences = list(APP_STATE.get("contract_sentences") or [])
+    units = list(APP_STATE.get("contract_units") or [])
     APP_STATE["reviewing"] = True
     key = current_api_key()
-    return _sse_with_key(key, review_sentences(sentences), kind="review")
+    return _sse_with_key(key, review_sentences(units), kind="review")
 
 
 @app.route("/api/chat", methods=["POST"])
